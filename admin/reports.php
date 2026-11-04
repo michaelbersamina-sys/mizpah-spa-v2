@@ -792,7 +792,7 @@ h1 {
 
             <div class="filter-actions">
                 <button type="submit" class="btn btn-primary">Apply Filters</button>
-                <a href="sales-report.php" class="btn btn-secondary">Reset</a>
+                <a href="reports.php" class="reset-btn">Reset</a>
             </div>
         </form>
     </section>
