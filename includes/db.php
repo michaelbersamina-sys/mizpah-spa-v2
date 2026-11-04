@@ -26,5 +26,3 @@ if (!mysqli_real_connect(
 )) {
     die("MySQL connection failed: " . mysqli_connect_error());
 }
-
-?>
