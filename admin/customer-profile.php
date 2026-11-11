@@ -1,4 +1,3 @@
-```php
 <?php
 session_start();
 include '../includes/db.php';
@@ -555,4 +554,3 @@ body {
 
 </body>
 </html>
-```
