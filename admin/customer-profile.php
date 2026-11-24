@@ -1,3 +1,4 @@
+```php
 <?php
 session_start();
 include '../includes/db.php';
@@ -68,74 +69,6 @@ $customer = mysqli_fetch_assoc($query);
 if (!$customer) {
     header("Location: users.php");
     exit;
-}
-
-
-/* ================= BOOKING HISTORY ================= */
-$bookingHistory = [];
-$historyQuery = mysqli_query($conn, "
-    SELECT
-        id,
-        customer_name,
-        phone,
-        service,
-        duration,
-        price,
-        booking_date,
-        booking_time,
-        pax,
-        status,
-        payment_method,
-        room_type,
-        created_at
-    FROM bookings
-    WHERE user_id = $customer_id
-    ORDER BY booking_date DESC, booking_time DESC, id DESC
-");
-
-if ($historyQuery) {
-    while ($booking = mysqli_fetch_assoc($historyQuery)) {
-        $booking['guests'] = [];
-
-        $bookingId = (int)$booking['id'];
-        $guestQuery = mysqli_query($conn, "
-            SELECT
-                bg.id AS booking_guest_id,
-                bg.guest_number,
-                bg.guest_name,
-                bg.service,
-                bg.duration,
-                bg.price,
-                bg.addons
-            FROM booking_guests bg
-            WHERE bg.booking_id = $bookingId
-            ORDER BY bg.guest_number ASC
-        ");
-
-        if ($guestQuery) {
-            while ($guest = mysqli_fetch_assoc($guestQuery)) {
-                $guest['addon_items'] = [];
-                $bookingGuestId = (int)$guest['booking_guest_id'];
-
-                $addonQuery = mysqli_query($conn, "
-                    SELECT addon_name, quantity, price
-                    FROM booking_guest_addons
-                    WHERE booking_guest_id = $bookingGuestId
-                    ORDER BY id ASC
-                ");
-
-                if ($addonQuery) {
-                    while ($addon = mysqli_fetch_assoc($addonQuery)) {
-                        $guest['addon_items'][] = $addon;
-                    }
-                }
-
-                $booking['guests'][] = $guest;
-            }
-        }
-
-        $bookingHistory[] = $booking;
-    }
 }
 
 function displayValue($value) {
@@ -416,115 +349,6 @@ body {
     margin: 0;
 }
 
-
-.history-count {
-    margin-left: auto;
-    color: var(--gold);
-    background: rgba(214,194,156,.09);
-    border: 1px solid rgba(214,194,156,.2);
-    border-radius: 20px;
-    padding: 7px 11px;
-    font-size: 11px;
-    white-space: nowrap;
-}
-.booking-history-list {
-    display: grid;
-    gap: 14px;
-}
-.history-card {
-    background: var(--panel-inner);
-    border: 1px solid #302b22;
-    border-radius: 10px;
-    padding: 17px;
-}
-.history-top, .guest-heading {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-    flex-wrap: wrap;
-}
-.booking-reference {
-    color: var(--gold-dark);
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 1px;
-}
-.history-top h4 {
-    color: var(--text);
-    font-size: 14px;
-    margin: 6px 0 0;
-}
-.status-pill {
-    display: inline-flex;
-    padding: 6px 10px;
-    border-radius: 20px;
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: capitalize;
-    background: rgba(214,194,156,.1);
-    color: var(--gold);
-}
-.status-completed { background: rgba(93,160,112,.13); color: #9bd5a8; }
-.status-confirmed { background: rgba(214,194,156,.13); color: var(--gold); }
-.status-cancelled { background: rgba(190,91,91,.13); color: #e6a0a0; }
-.status-pending { background: rgba(191,155,89,.13); color: #d8bd82; }
-.history-meta {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px 17px;
-    color: var(--muted);
-    font-size: 11px;
-    margin: 12px 0;
-}
-.history-guests {
-    display: grid;
-    gap: 9px;
-}
-.history-guest {
-    padding: 12px 13px;
-    border-radius: 8px;
-    background: #171613;
-    border: 1px solid rgba(214,194,156,.1);
-}
-.guest-heading strong {
-    color: var(--text);
-    font-size: 12px;
-}
-.guest-heading .guest-price {
-    color: var(--gold);
-    white-space: nowrap;
-}
-.history-guest p {
-    color: #c4bcaf;
-    font-size: 12px;
-    margin: 7px 0 0;
-}
-.history-guest p span {
-    color: var(--gold-dark);
-    padding: 0 4px;
-}
-.guest-addons {
-    color: var(--muted);
-    font-size: 11px;
-    margin-top: 7px;
-    line-height: 1.5;
-}
-.history-empty {
-    text-align: center;
-    padding: 30px 15px;
-    border: 1px dashed #403a2e;
-    border-radius: 9px;
-}
-.history-empty strong {
-    color: var(--text);
-    font-size: 13px;
-}
-.history-empty p {
-    color: var(--muted);
-    font-size: 11px;
-    margin: 7px 0 0;
-}
 @media (max-width: 1000px) {
     .main {
         padding: 24px;
@@ -592,7 +416,7 @@ body {
             <p class="eyebrow">Mizpah Wellness Spa · Administration</p>
             <h2>Customer Profile</h2>
             <p class="page-description">
-                View customer information, saved wellness profile, and booking history.
+                View customer account details and wellness preferences.
             </p>
         </div>
 
@@ -618,12 +442,7 @@ body {
     <div class="section">
 
         <div class="section-header">
-            <div class="section-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="12" cy="8" r="3.5"></circle>
-                    <path d="M5 20c.6-3.4 3.1-5.2 7-5.2s6.4 1.8 7 5.2"></path>
-                </svg>
-            </div>
+            <div class="section-icon">&#9679;</div>
             <div>
                 <h3>Customer Information</h3>
                 <p>Basic account and contact details</p>
@@ -659,12 +478,7 @@ body {
     <div class="section">
 
         <div class="section-header">
-            <div class="section-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z"></path>
-                    <path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15z"></path>
-                </svg>
-            </div>
+            <div class="section-icon">&#10022;</div>
             <div>
                 <h3>Wellness Information</h3>
                 <p>Customer health considerations and massage preferences</p>
@@ -727,111 +541,6 @@ body {
         </div>
     </div>
 
-
-    <!-- BOOKING HISTORY -->
-    <div class="section">
-        <div class="section-header">
-            <div class="section-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                    <rect x="3.5" y="5" width="17" height="16" rx="2"></rect>
-                    <path d="M7.5 3v4M16.5 3v4M3.5 9.5h17"></path>
-                    <path d="M8 13h.01M12 13h.01M16 13h.01M8 17h.01M12 17h.01"></path>
-                </svg>
-            </div>
-            <div>
-                <h3>Booking History</h3>
-                <p>All bookings linked to this customer account</p>
-            </div>
-            <span class="history-count">
-                <?= count($bookingHistory) ?> booking<?= count($bookingHistory) === 1 ? '' : 's' ?>
-            </span>
-        </div>
-
-        <?php if (!empty($bookingHistory)): ?>
-            <div class="booking-history-list">
-                <?php foreach ($bookingHistory as $booking): ?>
-                    <?php
-                    $status = strtolower(trim($booking['status'] ?? ''));
-                    $statusClass = preg_replace('/[^a-z0-9_-]/', '', $status);
-
-                    $bookingDate = !empty($booking['booking_date'])
-                        ? date('M d, Y', strtotime($booking['booking_date']))
-                        : 'Date not available';
-
-                    $bookingTime = !empty($booking['booking_time'])
-                        ? date('g:i A', strtotime($booking['booking_time']))
-                        : 'Time not available';      
-                         
-                    ?>
-                    <article class="history-card">
-                        <div class="history-top">
-                            <div>
-                                <span class="booking-reference">BOOKING #<?= (int)$booking['id'] ?></span>
-                                <h4><?= htmlspecialchars($bookingDate) ?> · <?= htmlspecialchars($bookingTime) ?></h4>
-                            </div>
-                            <span class="status-pill status-<?= htmlspecialchars($statusClass) ?>">
-                                <?= htmlspecialchars($booking['status'] ?? 'Unknown') ?>
-                            </span>
-                        </div>
-
-                        <div class="history-meta">
-                            <span><?= (int)($booking['pax'] ?? 1) ?> guest<?= (int)($booking['pax'] ?? 1) === 1 ? '' : 's' ?></span>
-                            <span><?= htmlspecialchars($booking['room_type'] ?: 'Room not specified') ?></span>
-                            <span><?= htmlspecialchars($booking['payment_method'] ?: 'Payment not specified') ?></span>
-                        </div>
-
-                        <?php if (!empty($booking['guests'])): ?>
-                            <div class="history-guests">
-                                <?php foreach ($booking['guests'] as $guest): ?>
-                                    <div class="history-guest">
-                                        <div class="guest-heading">
-                                            <strong>Guest <?= (int)$guest['guest_number'] ?> · <?= htmlspecialchars($guest['guest_name'] ?: 'Unnamed guest') ?></strong>
-                                            <strong class="guest-price">₱<?= number_format((float)$guest['price'], 2) ?></strong>
-                                        </div>
-                                        <p>
-                                            <?= htmlspecialchars($guest['service'] ?: ($booking['service'] ?: 'Service not specified')) ?>
-                                            <span>·</span>
-                                            <?= htmlspecialchars($guest['duration'] ?: ($booking['duration'] ?: 'Duration not specified')) ?>
-                                        </p>
-
-                                        <?php if (!empty($guest['addon_items'])): ?>
-                                            <div class="guest-addons">
-                                                Add-ons:
-                                                <?php
-                                                    $addonLabels = [];
-                                                    foreach ($guest['addon_items'] as $addon) {
-                                                        $addonLabels[] = htmlspecialchars($addon['addon_name']) .
-                                                            ((int)$addon['quantity'] > 1 ? ' × ' . (int)$addon['quantity'] : '');
-                                                    }
-                                                    echo implode(', ', $addonLabels);
-                                                ?>
-                                            </div>
-                                        <?php elseif (!empty($guest['addons'])): ?>
-                                            <div class="guest-addons">Add-ons: <?= htmlspecialchars($guest['addons']) ?></div>
-                                        <?php endif; ?>
-                                    </div>
-                                <?php endforeach; ?>
-                            </div>
-                        <?php else: ?>
-                            <div class="history-guest">
-                                <div class="guest-heading">
-                                    <strong><?= htmlspecialchars($booking['service'] ?: 'Service not specified') ?></strong>
-                                    <strong class="guest-price">₱<?= number_format((float)$booking['price'], 2) ?></strong>
-                                </div>
-                                <p><?= htmlspecialchars($booking['duration'] ?: 'Duration not specified') ?></p>
-                            </div>
-                        <?php endif; ?>
-                    </article>
-                <?php endforeach; ?>
-            </div>
-        <?php else: ?>
-            <div class="history-empty">
-                <strong>No booking history yet</strong>
-                <p>Bookings made using this customer account will appear here.</p>
-            </div>
-        <?php endif; ?>
-    </div>
-
     <div class="profile-footer">
         <p class="footer-note">
             Customer information is displayed for authorized administration use.
@@ -846,3 +555,4 @@ body {
 
 </body>
 </html>
+```
