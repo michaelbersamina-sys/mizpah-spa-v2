@@ -1,13 +1,31 @@
 <?php
-$host = "127.0.0.1";
-$user = "root";
-$pass = "";
-$db = "mizpah_spa";
-$port = 3307;
+$host = getenv('DB_HOST');
+$user = getenv('DB_USER');
+$pass = getenv('DB_PASS');
+$db = getenv('DB_NAME');
+$port = (int) getenv('DB_PORT');
 
-$conn = mysqli_connect($host, $user, $pass, $db, $port);
+$conn = mysqli_init();
 
-if (!$conn) {
-    die("MySQL connection failed: " . mysqli_connect_error());
+mysqli_ssl_set(
+    $conn,
+    null,
+    null,
+    __DIR__ . '/certs/ca.pem',
+    null,
+    null
+);
+
+if (!mysqli_real_connect(
+    $conn,
+    $host,
+    $user,
+    $pass,
+    $db,
+    $port,
+    null,
+    MYSQLI_CLIENT_SSL
+)) {
+    die("Database connection failed: " . mysqli_connect_error());
 }
 ?>
