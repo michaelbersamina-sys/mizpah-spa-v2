@@ -204,17 +204,25 @@ $data = [];
 
 if ($chartPeriod === 'weekly') {
     $periodSelect = "YEARWEEK(b.booking_date, 1)";
-    $labelSelect = "CONCAT('Week of ', DATE_FORMAT(MIN(b.booking_date - INTERVAL WEEKDAY(b.booking_date) DAY), '%b %d, %Y'))";
-    $orderSelect = "YEARWEEK(b.booking_date, 1)";
+    $labelSelect = "CONCAT('Week of ', DATE_FORMAT(MIN(DATE_SUB(b.booking_date, INTERVAL WEEKDAY(b.booking_date) DAY)), '%b %d, %Y'))";
 } elseif ($chartPeriod === 'monthly') {
     $periodSelect = "DATE_FORMAT(b.booking_date, '%Y-%m')";
     $labelSelect = "DATE_FORMAT(MIN(b.booking_date), '%b %Y')";
-    $orderSelect = "DATE_FORMAT(b.booking_date, '%Y-%m')";
 } else {
     $periodSelect = "DATE(b.booking_date)";
     $labelSelect = "DATE_FORMAT(MIN(b.booking_date), '%b %d, %Y')";
-    $orderSelect = "DATE(b.booking_date)";
 }
+
+$daily = mysqli_query($conn, "
+    SELECT
+        $periodSelect AS period_key,
+        $labelSelect AS period_label,
+        COALESCE(SUM(b.price), 0) AS total
+    FROM bookings b
+    $revenueWhereSQL
+    GROUP BY period_key
+    ORDER BY period_key ASC
+");
 
 if ($daily) {
     while ($row = mysqli_fetch_assoc($daily)) {
