@@ -88,42 +88,55 @@ if ($paymentResult) {
 
 /* Count primary services per guest. Allocate booking totals safely when
    older guest rows have no individual price saved. */
+
 $services = mysqli_query($conn, "
-    SELECT service_name, SUM(guest_count) AS total,
+    SELECT service_name,
+           SUM(guest_count) AS total,
            SUM(service_revenue) AS revenue
     FROM (
         SELECT
-            COALESCE(
-                NULLIF(TRIM(bg.service), ''),
-                NULLIF(TRIM(s.service_name), ''),
-                CASE
-                    WHEN TRIM(COALESCE(b.service, '')) = '' THEN NULL
-                    WHEN LOWER(TRIM(b.service)) LIKE 'group booking%' THEN NULL
-                    WHEN LOWER(TRIM(b.service)) IN ('individual booking', 'couple booking') THEN NULL
-                    ELSE TRIM(b.service)
-                END
-            ) AS service_name,
+            service_rows.service_name,
             COUNT(*) AS guest_count,
-            SUM(
+            SUM(service_rows.service_revenue) AS service_revenue
+        FROM (
+            SELECT
+                bg.id AS guest_id,
+                b.id AS booking_id,
+                COALESCE(
+                    NULLIF(TRIM(bg.service), ''),
+                    NULLIF(TRIM(s.service_name), ''),
+                    CASE
+                        WHEN TRIM(COALESCE(b.service, '')) = '' THEN NULL
+                        WHEN LOWER(TRIM(b.service)) LIKE 'group booking%' THEN NULL
+                        WHEN LOWER(TRIM(b.service)) IN ('individual booking', 'couple booking') THEN NULL
+                        ELSE TRIM(b.service)
+                    END
+                ) AS service_name,
                 CASE
                     WHEN COALESCE(bg.price, 0) > 0 THEN bg.price
                     WHEN COALESCE(b.price, 0) > 0 THEN
                         GREATEST(b.price - COALESCE(addon_totals.addon_total, 0), 0)
                         / GREATEST(COALESCE(b.pax, 1), 1)
                     ELSE 0
-                END
-            ) AS service_revenue
-        FROM booking_guests bg
-        INNER JOIN bookings b ON b.id = bg.booking_id
-        LEFT JOIN services s ON s.id = bg.service_id
-        LEFT JOIN (
-            SELECT bga.booking_guest_id, SUM(bga.price * GREATEST(bga.quantity, 1)) AS addon_total
-            FROM booking_guest_addons bga
-            GROUP BY bga.booking_guest_id
-        ) addon_totals ON addon_totals.booking_guest_id = bg.id
-        $revenueWhereSQL
-        GROUP BY service_name, b.id
+                END AS service_revenue
+            FROM booking_guests bg
+            INNER JOIN bookings b ON b.id = bg.booking_id
+            LEFT JOIN services s ON s.id = bg.service_id
+            LEFT JOIN (
+                SELECT
+                    bga.booking_guest_id,
+                    SUM(bga.price * GREATEST(bga.quantity, 1)) AS addon_total
+                FROM booking_guest_addons bga
+                GROUP BY bga.booking_guest_id
+            ) addon_totals ON addon_totals.booking_guest_id = bg.id
+            $revenueWhereSQL
+        ) service_rows
+        WHERE service_rows.service_name IS NOT NULL
+          AND TRIM(service_rows.service_name) <> ''
+        GROUP BY service_rows.service_name, service_rows.booking_id
+
         UNION ALL
+
         SELECT
             CASE
                 WHEN TRIM(COALESCE(b.service, '')) = '' THEN NULL
@@ -138,7 +151,8 @@ $services = mysqli_query($conn, "
         $revenueWhereSQL
         AND bg.id IS NULL
     ) service_rows
-    WHERE service_name IS NOT NULL AND TRIM(service_name) <> ''
+    WHERE service_name IS NOT NULL
+      AND TRIM(service_name) <> ''
     GROUP BY service_name
     ORDER BY total DESC, revenue DESC
     LIMIT 5
