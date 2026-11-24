@@ -1,3 +1,4 @@
+
 <?php
 session_start();
 include '../includes/db.php';
@@ -13,132 +14,206 @@ date_default_timezone_set('Asia/Manila');
 $from = $_GET['from'] ?? '';
 $to = $_GET['to'] ?? '';
 $status = $_GET['status'] ?? '';
+$chartPeriod = $_GET['period'] ?? 'daily';
 
 $allowedStatuses = ['Confirmed', 'Completed'];
-
-if (!in_array($status, $allowedStatuses, true)) {
-    $status = '';
-}
+if (!in_array($status, $allowedStatuses, true)) $status = '';
+if (!in_array($chartPeriod, ['daily', 'weekly', 'monthly'], true)) $chartPeriod = 'daily';
 
 $isValidDate = function ($date) {
     if ($date === '') return true;
     $d = DateTime::createFromFormat('!Y-m-d', $date);
     return $d && $d->format('Y-m-d') === $date;
 };
-
 if (!$isValidDate($from)) $from = '';
 if (!$isValidDate($to)) $to = '';
+if ($from && $to && $from > $to) [$from, $to] = [$to, $from];
 
-if ($from && $to && $from > $to) {
-    [$from, $to] = [$to, $from];
-}
-
-/*
- Default: Confirmed + Completed.
- Kapag may status filter, iyon ang gagamitin.
-*/
-$where = ["status IN ('Completed','Confirmed')"];
-
-if ($status !== '') {
-    $safeStatus = mysqli_real_escape_string($conn, $status);
-    $where = ["status = '$safeStatus'"];
-}
-
-$where[] = "price > 0";
-
+$dateConditions = [];
 if ($from !== '') {
     $safeFrom = mysqli_real_escape_string($conn, $from);
-    $where[] = "booking_date >= '$safeFrom'";
+    $dateConditions[] = "b.booking_date >= '$safeFrom'";
 }
-
 if ($to !== '') {
     $safeTo = mysqli_real_escape_string($conn, $to);
-    $where[] = "booking_date <= '$safeTo'";
+    $dateConditions[] = "b.booking_date <= '$safeTo'";
 }
+$dateWhereSQL = $dateConditions ? ' AND ' . implode(' AND ', $dateConditions) : '';
 
-$whereSQL = 'WHERE ' . implode(' AND ', $where);
+$revenueConditions = ["b.status IN ('Completed','Confirmed')"];
+if ($status !== '') {
+    $safeStatus = mysqli_real_escape_string($conn, $status);
+    $revenueConditions = ["b.status = '$safeStatus'"];
+}
+$revenueWhereSQL = 'WHERE ' . implode(' AND ', $revenueConditions) . $dateWhereSQL;
 
-/* ================= TOTAL REVENUE ================= */
+/*
+  IMPORTANT:
+  bookings.price stores the total amount for the whole booking.
+  Do not multiply it by pax; doing so doubles group-booking revenue.
+*/
 $totalSales = 0;
 $totalBookings = 0;
-
-$result = mysqli_query($conn, "
-    SELECT
-        COALESCE(SUM(price * GREATEST(COALESCE(pax, 1), 1)), 0) AS total,
-        COUNT(*) AS booking_count
-    FROM bookings
-    $whereSQL
+$summaryResult = mysqli_query($conn, "
+    SELECT COALESCE(SUM(b.price), 0) AS total,
+           COUNT(*) AS booking_count
+    FROM bookings b
+    $revenueWhereSQL
+    AND COALESCE(b.price, 0) > 0
 ");
-
-if ($result) {
-    $row = mysqli_fetch_assoc($result);
+if ($summaryResult) {
+    $row = mysqli_fetch_assoc($summaryResult);
     $totalSales = (float)($row['total'] ?? 0);
     $totalBookings = (int)($row['booking_count'] ?? 0);
 }
 
-/* ================= PAYMENT BREAKDOWN ================= */
-/* Always show Cash and GCash, even if their totals are zero. */
-$paymentTotals = [
-    'Cash' => 0,
-    'GCash' => 0
-];
-
+/* Payment totals use the booking total once, including group bookings. */
+$paymentTotals = ['Cash' => 0, 'GCash' => 0];
 $paymentResult = mysqli_query($conn, "
-    SELECT
-        CASE
-            WHEN LOWER(TRIM(COALESCE(payment_method, ''))) = 'gcash'
-                THEN 'GCash'
-            WHEN TRIM(COALESCE(payment_method, '')) = ''
-                THEN 'Cash'
-            ELSE 'Cash'
-        END AS method,
-        COALESCE(SUM(price * GREATEST(COALESCE(pax, 1), 1)), 0) AS total
-    FROM bookings
-    $whereSQL
+    SELECT CASE
+        WHEN LOWER(TRIM(COALESCE(b.payment_method, ''))) = 'gcash' THEN 'GCash'
+        ELSE 'Cash'
+    END AS method,
+    COALESCE(SUM(b.price), 0) AS total
+    FROM bookings b
+    $revenueWhereSQL
     GROUP BY method
 ");
-
 if ($paymentResult) {
     while ($row = mysqli_fetch_assoc($paymentResult)) {
-        $method = $row['method'];
-        if (isset($paymentTotals[$method])) {
-            $paymentTotals[$method] = (float)$row['total'];
+        if (isset($paymentTotals[$row['method']])) {
+            $paymentTotals[$row['method']] = (float)$row['total'];
         }
     }
 }
 
-/* ================= TOP SERVICES ================= */
+/* Count primary services per guest. Allocate booking totals safely when
+   older guest rows have no individual price saved. */
 $services = mysqli_query($conn, "
-    SELECT service, COUNT(*) AS total
-    FROM bookings
-    $whereSQL
-      AND COALESCE(service, '') != ''
-    GROUP BY service
-    ORDER BY total DESC
+    SELECT service_name, SUM(guest_count) AS total,
+           SUM(service_revenue) AS revenue
+    FROM (
+        SELECT
+            COALESCE(
+                NULLIF(TRIM(bg.service), ''),
+                NULLIF(TRIM(s.service_name), ''),
+                CASE
+                    WHEN TRIM(COALESCE(b.service, '')) = '' THEN NULL
+                    WHEN LOWER(TRIM(b.service)) LIKE 'group booking%' THEN NULL
+                    WHEN LOWER(TRIM(b.service)) IN ('individual booking', 'couple booking') THEN NULL
+                    ELSE TRIM(b.service)
+                END
+            ) AS service_name,
+            COUNT(*) AS guest_count,
+            SUM(
+                CASE
+                    WHEN COALESCE(bg.price, 0) > 0 THEN bg.price
+                    WHEN COALESCE(b.price, 0) > 0 THEN
+                        GREATEST(b.price - COALESCE(addon_totals.addon_total, 0), 0)
+                        / GREATEST(COALESCE(b.pax, 1), 1)
+                    ELSE 0
+                END
+            ) AS service_revenue
+        FROM booking_guests bg
+        INNER JOIN bookings b ON b.id = bg.booking_id
+        LEFT JOIN services s ON s.id = bg.service_id
+        LEFT JOIN (
+            SELECT bga.booking_guest_id, SUM(bga.price * GREATEST(bga.quantity, 1)) AS addon_total
+            FROM booking_guest_addons bga
+            GROUP BY bga.booking_guest_id
+        ) addon_totals ON addon_totals.booking_guest_id = bg.id
+        $revenueWhereSQL
+        GROUP BY service_name, b.id
+        UNION ALL
+        SELECT
+            CASE
+                WHEN TRIM(COALESCE(b.service, '')) = '' THEN NULL
+                WHEN LOWER(TRIM(b.service)) LIKE 'group booking%' THEN NULL
+                WHEN LOWER(TRIM(b.service)) IN ('individual booking', 'couple booking') THEN NULL
+                ELSE TRIM(b.service)
+            END AS service_name,
+            1 AS guest_count,
+            GREATEST(COALESCE(b.price, 0), 0) AS service_revenue
+        FROM bookings b
+        LEFT JOIN booking_guests bg ON bg.booking_id = b.id
+        $revenueWhereSQL
+        AND bg.id IS NULL
+    ) service_rows
+    WHERE service_name IS NOT NULL AND TRIM(service_name) <> ''
+    GROUP BY service_name
+    ORDER BY total DESC, revenue DESC
     LIMIT 5
 ");
 
-/* ================= DAILY SALES ================= */
-$labels = [];
-$data = [];
-
-$daily = mysqli_query($conn, "
-    SELECT
-        booking_date,
-        COALESCE(SUM(price * GREATEST(COALESCE(pax, 1), 1)), 0) AS total
-    FROM bookings
-    $whereSQL
-    GROUP BY booking_date
-    ORDER BY booking_date ASC
-");
-
-if ($daily && mysqli_num_rows($daily) > 0) {
-    while ($row = mysqli_fetch_assoc($daily)) {
-        $labels[] = date('M d, Y', strtotime($row['booking_date']));
-        $data[] = (float)$row['total'];
+$topServiceLabels = [];
+$topServiceGuests = [];
+$topServiceRevenue = [];
+if ($services) {
+    while ($serviceRow = mysqli_fetch_assoc($services)) {
+        $topServiceLabels[] = $serviceRow['service_name'];
+        $topServiceGuests[] = (int)($serviceRow['total'] ?? 0);
+        $topServiceRevenue[] = (float)($serviceRow['revenue'] ?? 0);
     }
 }
 
+/* Add-ons are shown separately; their amounts are already included in booking revenue. */
+$addonSales = mysqli_query($conn, "
+    SELECT bga.addon_name,
+           SUM(GREATEST(bga.quantity, 1)) AS quantity_sold,
+           SUM(bga.price * GREATEST(bga.quantity, 1)) AS revenue
+    FROM booking_guest_addons bga
+    INNER JOIN booking_guests bg ON bg.id = bga.booking_guest_id
+    INNER JOIN bookings b ON b.id = bg.booking_id
+    $revenueWhereSQL
+    GROUP BY bga.addon_name
+    ORDER BY quantity_sold DESC, revenue DESC
+    LIMIT 10
+");
+
+/* Status counts are reported separately, including cancelled and pending. */
+$statusCounts = ['Completed' => 0, 'Confirmed' => 0, 'Cancelled' => 0, 'Pending' => 0];
+$statusResult = mysqli_query($conn, "
+    SELECT b.status, COUNT(*) AS total
+    FROM bookings b
+    WHERE 1=1 $dateWhereSQL
+    GROUP BY b.status
+");
+if ($statusResult) {
+    while ($row = mysqli_fetch_assoc($statusResult)) {
+        $key = ucfirst(strtolower(trim($row['status'] ?? '')));
+        if (isset($statusCounts[$key])) $statusCounts[$key] = (int)$row['total'];
+    }
+}
+
+/* Daily / weekly / monthly revenue chart. */
+$labels = [];
+$data = [];
+if ($chartPeriod === 'weekly') {
+    $periodSelect = "YEARWEEK(b.booking_date, 1)";
+    $labelSelect = "CONCAT('Week of ', DATE_FORMAT(MIN(DATE_SUB(b.booking_date, INTERVAL WEEKDAY(b.booking_date) DAY)), '%b %d, %Y'))";
+    $orderSelect = "YEARWEEK(b.booking_date, 1)";
+} elseif ($chartPeriod === 'monthly') {
+    $periodSelect = "DATE_FORMAT(b.booking_date, '%Y-%m')";
+    $labelSelect = "DATE_FORMAT(b.booking_date, '%b %Y')";
+    $orderSelect = "DATE_FORMAT(b.booking_date, '%Y-%m')";
+} else {
+    $periodSelect = "DATE(b.booking_date)";
+    $labelSelect = "DATE_FORMAT(b.booking_date, '%b %d, %Y')";
+    $orderSelect = "DATE(b.booking_date)";
+}
+$daily = mysqli_query($conn, "
+    SELECT $labelSelect AS period_label, COALESCE(SUM(b.price), 0) AS total
+    FROM bookings b
+    $revenueWhereSQL
+    GROUP BY $periodSelect
+    ORDER BY $orderSelect ASC
+");
+if ($daily) {
+    while ($row = mysqli_fetch_assoc($daily)) {
+        $labels[] = $row['period_label'];
+        $data[] = (float)$row['total'];
+    }
+}
 $hasChartData = count($labels) > 0;
 
 function e($value) {
@@ -338,7 +413,7 @@ h1 {
 
 .summary-grid {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 15px;
     margin-bottom: 20px;
 }
@@ -535,6 +610,12 @@ h1 {
     height: 300px;
 }
 
+.top-services-chart-container {
+    position: relative;
+    width: 100%;
+    height: 280px;
+}
+
 .report-footer {
     color: #716c63;
     font-size: 10px;
@@ -572,7 +653,7 @@ h1 {
     }
 
     .summary-grid {
-        grid-template-columns: 1fr;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 10px;
     }
 
@@ -592,10 +673,18 @@ h1 {
     .chart-container {
         height: 250px;
     }
+
+    .top-services-chart-container {
+        height: 250px;
+    }
 }
 
 @media (max-width: 420px) {
     .filter-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .summary-grid {
         grid-template-columns: 1fr;
     }
 
@@ -736,6 +825,77 @@ h1 {
         font-size: 8pt;
     }
 }
+
+
+/* Final print overrides: always use the report layout, never the mobile UI. */
+@media print {
+    html,
+    body {
+        width: 100% !important;
+        min-width: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: visible !important;
+    }
+
+    .main {
+        display: block !important;
+        width: 100% !important;
+        max-width: none !important;
+        margin: 0 !important;
+        padding: 0 !important;
+    }
+
+    /* Remove screen-only controls, including mobile menu/action buttons. */
+    .header-actions,
+    .header-actions *,
+    .filter-card,
+    .sidebar,
+    aside,
+    nav,
+    .no-print,
+    button,
+    .menu-toggle,
+    .mobile-menu,
+    .mobile-menu-toggle,
+    .sidebar-toggle,
+    .hamburger {
+        display: none !important;
+        visibility: hidden !important;
+    }
+
+    /* Keep report sections in their desktop/tablet print arrangement. */
+    .page-header {
+        display: block !important;
+        width: 100% !important;
+    }
+
+    .summary-grid {
+        display: grid !important;
+        grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
+        gap: 8px !important;
+    }
+
+    .content-grid {
+        display: grid !important;
+        grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+        gap: 10px !important;
+    }
+
+    .chart-container,
+    .top-services-chart-container {
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+
+    .card,
+    .payment-row,
+    .chart-card {
+        break-inside: avoid !important;
+        page-break-inside: avoid !important;
+    }
+}
+
 </style>
 </head>
 
@@ -790,9 +950,18 @@ h1 {
                 </select>
             </div>
 
+            <div class="field">
+                <label for="period">Sales Chart Period</label>
+                <select id="period" name="period">
+                    <option value="daily" <?= $chartPeriod === 'daily' ? 'selected' : '' ?>>Daily</option>
+                    <option value="weekly" <?= $chartPeriod === 'weekly' ? 'selected' : '' ?>>Weekly</option>
+                    <option value="monthly" <?= $chartPeriod === 'monthly' ? 'selected' : '' ?>>Monthly</option>
+                </select>
+            </div>
+
             <div class="filter-actions">
                 <button type="submit" class="btn btn-primary">Apply Filters</button>
-                <a href="sales-report.php" class="btn btn-secondary">Reset</a>
+                <a href="reports.php" class="btn btn-secondary">Reset</a>
             </div>
         </form>
     </section>
@@ -801,23 +970,22 @@ h1 {
         <article class="card">
             <div class="summary-label">Total Revenue</div>
             <div class="summary-value">₱<?= number_format($totalSales, 2) ?></div>
-            <div class="summary-note">Based on price × pax</div>
+            <div class="summary-note">Completed + confirmed · booking total counted once</div>
         </article>
-
         <article class="card">
-            <div class="summary-label">Included Bookings</div>
+            <div class="summary-label">Total Bookings</div>
             <div class="summary-value"><?= number_format($totalBookings) ?></div>
-            <div class="summary-note">Matching the selected filters</div>
+            <div class="summary-note">Matching revenue filters</div>
         </article>
-
         <article class="card">
-            <div class="summary-label">Report Period</div>
-            <div class="summary-value" style="font-size: clamp(17px, 2vw, 23px);">
-                <?= e($periodLabel) ?>
-            </div>
-            <div class="summary-note">
-                <?= $status !== '' ? e($status) : 'Confirmed + Completed' ?>
-            </div>
+            <div class="summary-label">Completed Bookings</div>
+            <div class="summary-value"><?= number_format($statusCounts['Completed']) ?></div>
+            <div class="summary-note">Within selected date range</div>
+        </article>
+        <article class="card">
+            <div class="summary-label">Confirmed Bookings</div>
+            <div class="summary-value"><?= number_format($statusCounts['Confirmed']) ?></div>
+            <div class="summary-note">Within selected date range</div>
         </article>
     </section>
 
@@ -881,37 +1049,95 @@ h1 {
             <div class="card-heading">
                 <div>
                     <h2 class="card-title">Top Services</h2>
-                    <div class="card-description">Most frequently booked services</div>
+                    <div class="card-description">Top 5 services ranked by guest count</div>
                 </div>
                 <span class="badge">TOP 5</span>
             </div>
 
-            <?php if ($services && mysqli_num_rows($services) > 0): ?>
+            
+<?php if (!empty($topServiceLabels)): ?>
+    <div class="service-list">
+        <?php foreach ($topServiceLabels as $index => $serviceName): ?>
+            <div class="service-row">
+                <div class="service-rank">
+                    <?= $index + 1 ?>
+                </div>
+
+                <div>
+                    <div class="service-name">
+                        <?= e($serviceName) ?>
+                    </div>
+                    <div class="service-count">
+                        <?= number_format((int)($topServiceGuests[$index] ?? 0)) ?>
+                        <?= (int)($topServiceGuests[$index] ?? 0) === 1 ? 'guest' : 'guests' ?>
+                    </div>
+                </div>
+
+                <div class="payment-amount">
+                    ₱<?= number_format((float)($topServiceRevenue[$index] ?? 0), 2) ?>
+                </div>
+            </div>
+        <?php endforeach; ?>
+    </div>
+<?php else: ?>
+    <div class="empty-state">No service records found for these filters.</div>
+<?php endif; ?>
+
+        </article>
+    </section>
+
+    <section class="content-grid">
+        <article class="card">
+            <div class="card-heading">
+                <div>
+                    <h2 class="card-title">Add-on Sales</h2>
+                    <div class="card-description">Add-ons recorded per guest booking</div>
+                </div>
+                <span class="badge">TOP 10</span>
+            </div>
+            <?php if ($addonSales && mysqli_num_rows($addonSales) > 0): ?>
                 <div class="service-list">
-                    <?php $rank = 1; ?>
-                    <?php while ($s = mysqli_fetch_assoc($services)): ?>
+                    <?php while ($addon = mysqli_fetch_assoc($addonSales)): ?>
                         <div class="service-row">
-                            <div class="service-rank"><?= $rank++ ?></div>
-                            <div class="service-name"><?= e($s['service']) ?></div>
-                            <div class="service-count">
-                                <?= number_format((int)$s['total']) ?>
-                                <?= (int)$s['total'] === 1 ? 'booking' : 'bookings' ?>
+                            <div class="service-rank"><span aria-hidden="true">+</span></div>
+                            <div>
+                                <div class="service-name"><?= e($addon['addon_name']) ?></div>
+                                <div class="service-count"><?= number_format((int)$addon['quantity_sold']) ?> sold</div>
                             </div>
+                            <div class="payment-amount">₱<?= number_format((float)$addon['revenue'], 2) ?></div>
                         </div>
                     <?php endwhile; ?>
                 </div>
             <?php else: ?>
-                <div class="empty-state">No service records found for these filters.</div>
+                <div class="empty-state">No add-on sales found for these filters.</div>
             <?php endif; ?>
+            <div class="summary-note">Add-on amounts are already included in Total Revenue and are shown here for breakdown only.</div>
+        </article>
+
+        <article class="card">
+            <div class="card-heading">
+                <div>
+                    <h2 class="card-title">Booking Status Summary</h2>
+                    <div class="card-description">All booking statuses within the selected date range</div>
+                </div>
+            </div>
+            <div class="payment-list">
+                <?php foreach (['Completed', 'Confirmed', 'Cancelled', 'Pending'] as $statusName): ?>
+                    <div class="payment-row">
+                        <div class="payment-name"><?= e($statusName) ?></div>
+                        <div class="payment-amount"><?= number_format($statusCounts[$statusName]) ?></div>
+                    </div>
+                <?php endforeach; ?>
+            </div>
         </article>
     </section>
 
     <section class="card chart-card">
         <div class="card-heading">
             <div>
-                <h2 class="card-title">Daily Sales</h2>
+                <h2 class="card-title"><?= ucfirst($chartPeriod) ?> Sales</h2>
                 <div class="card-description">
-                    Daily revenue based on the selected filters
+                    Revenue grouped by <?= e($chartPeriod) ?> period using the selected filters
                 </div>
             </div>
             <span class="badge">REVENUE</span>
@@ -943,7 +1169,7 @@ new Chart(canvas, {
     data: {
         labels: salesLabels,
         datasets: [{
-            label: 'Daily Sales (₱)',
+            label: '<?= ucfirst($chartPeriod) ?> Sales (₱)',
             data: salesData,
             borderColor: '#b39b6b',
             backgroundColor: 'rgba(179, 155, 107, 0.12)',
@@ -1029,6 +1255,66 @@ window.addEventListener('afterprint', function() {
     chart.options.scales.y.grid.color = 'rgba(150, 140, 120, 0.12)';
     chart.resize();
     chart.update('none');
+});
+<?php endif; ?>
+
+<?php if (!empty($topServiceLabels)): ?>
+const topServiceLabels = <?= json_encode($topServiceLabels, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP) ?>;
+const topServiceGuests = <?= json_encode($topServiceGuests) ?>;
+const topServiceRevenue = <?= json_encode($topServiceRevenue) ?>;
+
+new Chart(document.getElementById('topServicesChart'), {
+    type: 'bar',
+    data: {
+        labels: topServiceLabels,
+        datasets: [{
+            label: 'Guests',
+            data: topServiceGuests,
+            backgroundColor: 'rgba(214, 194, 156, 0.78)',
+            borderColor: '#d6c29c',
+            borderWidth: 1,
+            borderRadius: 5,
+            maxBarThickness: 28
+        }]
+    },
+    options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+            legend: { display: false },
+            tooltip: {
+                callbacks: {
+                    label: function(context) {
+                        const i = context.dataIndex;
+                        const guests = Number(topServiceGuests[i]);
+                        const revenue = Number(topServiceRevenue[i]);
+                        return [
+                            ' ' + guests.toLocaleString('en-PH') + (guests === 1 ? ' guest' : ' guests'),
+                            ' Revenue: ₱' + revenue.toLocaleString('en-PH', {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2
+                            })
+                        ];
+                    }
+                }
+            }
+        },
+        scales: {
+            x: {
+                beginAtZero: true,
+                ticks: { color: '#a7a197', precision: 0, stepSize: 1 },
+                grid: { color: 'rgba(150, 140, 120, 0.12)' }
+            },
+            y: {
+                ticks: {
+                    color: '#e9e4da',
+                    font: { family: 'Poppins', size: 10 }
+                },
+                grid: { display: false }
+            }
+        }
+    }
 });
 <?php endif; ?>
 </script>

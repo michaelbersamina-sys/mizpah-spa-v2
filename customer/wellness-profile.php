@@ -169,6 +169,9 @@ if(isset($_POST['save_wellness'])){
     $emergency_contact_number =
         trim($_POST['emergency_contact_number'] ?? '');
 
+    // Philippine mobile number: 09XXXXXXXXX (11 digits)
+    $emergency_contact_number = preg_replace('/\\D+/', '', $emergency_contact_number);
+
 
     /* TERMS */
 
@@ -194,6 +197,12 @@ if(isset($_POST['save_wellness'])){
 
     elseif(!$terms_accepted){
         $error = "Please read and agree to the Terms and Conditions.";
+    }
+    elseif(
+        $emergency_contact_number !== '' &&
+        !preg_match('/^09[0-9]{9}$/', $emergency_contact_number)
+    ){
+        $error = "Please enter a valid Philippine mobile number (11 digits, starting with 09).";
     }
 
 
@@ -1361,12 +1370,19 @@ button:hover{
                     </label>
 
                     <input
-                        type="text"
+                        type="tel"
                         name="emergency_contact_number"
+                        id="emergencyContactNumber"
                         value="<?= htmlspecialchars(
-                            $profile['emergency_contact_number'] ?? ''
+                            $_POST['emergency_contact_number'] ?? ($profile['emergency_contact_number'] ?? '')
                         ) ?>"
-                        placeholder="e.g. 09XXXXXXXXX"
+                        placeholder="09XXXXXXXXX"
+                        inputmode="numeric"
+                        pattern="09[0-9]{9}"
+                        minlength="11"
+                        maxlength="11"
+                        autocomplete="tel"
+                        title="Enter an 11-digit Philippine mobile number starting with 09."
                     >
 
                 </div>
@@ -1526,6 +1542,19 @@ function toggleOther(
 
 }
 
+
+/* =========================
+   PH MOBILE NUMBER INPUT
+========================= */
+
+const emergencyNumberInput = document.getElementById('emergencyContactNumber');
+
+if (emergencyNumberInput) {
+    emergencyNumberInput.addEventListener('input', function () {
+        // Allow digits only and limit input to 11 characters.
+        this.value = this.value.replace(/\D/g, '').slice(0, 11);
+    });
+}
 
 /* =========================
    TERMS MODAL

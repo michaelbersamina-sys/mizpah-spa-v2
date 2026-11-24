@@ -1,8 +1,7 @@
 <?php
 session_start();
 date_default_timezone_set('Asia/Manila');
-
-include __DIR__ . '/../includes/db.php';
+require_once __DIR__ . '/../includes/db.php';
 
 if (!isset($_SESSION['user_id'])) {
     header('Location: ../login.php');
@@ -14,195 +13,319 @@ function bookingError(string $message): void {
     exit('BOOKING ERROR: ' . htmlspecialchars($message, ENT_QUOTES, 'UTF-8') .
         '<br><a href="walkin-booking.php">Go back to walk-in booking</a>');
 }
-
-function durationToMinutes(string $duration): int {
-    $value = strtolower(trim($duration));
-    if (preg_match('/(?:^|\D)2\s*(?:hr|hour)/', $value)) return 120;
-    if (preg_match('/(?:^|\D)1\.5\s*(?:hr|hour)/', $value) || strpos($value, '90 min') !== false) return 90;
-    if (preg_match('/(?:^|\D)1\s*(?:hr|hour)/', $value)) return 60;
+function walkinDurationMinutes($duration): int {
+    $duration = strtolower(trim((string)$duration));
+    $hours = 0.0;
+    $minutes = 0;
+    if (preg_match_all('/(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)/i', $duration, $hm)) {
+        foreach ($hm[1] as $value) $hours += (float)$value;
+    }
+    if (preg_match_all('/(\d+)\s*(?:minutes?|mins?)/i', $duration, $mm)) {
+        foreach ($mm[1] as $value) $minutes += (int)$value;
+    }
+    if ($hours > 0 || $minutes > 0) return (int)round($hours * 60) + $minutes;
+    if (is_numeric($duration)) { $n=(float)$duration; return $n>3?(int)round($n):(int)round($n*60); }
     return 60;
 }
-
-function toOperatingMinutes(string $time, int $openingHour): ?int {
-    if (!preg_match('/^([01]\d|2[0-3]):([0-5]\d)$/', $time, $match)) return null;
-    $hour = (int)$match[1];
-    $minute = (int)$match[2];
-    if ($hour < $openingHour) $hour += 24;
-    return $hour * 60 + $minute;
+function walkinOperatingMinutes($time, int $openingHour): ?int {
+    if (!preg_match('/^(\d{1,2}):(\d{2})(?::\d{2})?$/', trim((string)$time), $m)) return null;
+    $h=(int)$m[1]; $min=(int)$m[2];
+    if ($h>23 || $min>59) return null;
+    if ($h<$openingHour) $h+=24;
+    return $h*60+$min;
 }
 
-$roomType = trim($_POST['room_type'] ?? '');
-$serviceId = (int)($_POST['service_id'] ?? 0);
-$service = trim($_POST['service'] ?? '');
-$duration = trim($_POST['duration'] ?? '');
-$date = trim($_POST['booking_date'] ?? '');
-$time = trim($_POST['booking_time'] ?? '');
+$roomType = trim((string)($_POST['room_type'] ?? ''));
+$date = trim((string)($_POST['booking_date'] ?? ''));
+$time = trim((string)($_POST['booking_time'] ?? ''));
 $pax = (int)($_POST['pax'] ?? 1);
-$payment = trim($_POST['payment_method'] ?? 'Cash');
-$notes = trim($_POST['notes'] ?? '');
-$addons = trim($_POST['addons'] ?? '');
-$therapistId = (int)($_POST['therapist'] ?? 0);
-$therapistIds = $_POST['therapist_ids'] ?? [];
-if (!is_array($therapistIds)) $therapistIds = [];
-$therapistIds = array_values(array_unique(array_filter(array_map('intval', $therapistIds), static fn($id) => $id > 0)));
-if (!$therapistIds && $therapistId > 0) $therapistIds = [$therapistId];
-$therapistId = $therapistIds[0] ?? 0;
-
-if ($roomType === 'Couple Room') {
-    $pax = 2;
-} elseif ($roomType !== 'Single Room') {
-    bookingError('Please select a valid room type.');
-}
-if ($pax < 1 || $pax > 4) bookingError('Guest count must be between 1 and 4.');
-if (!in_array($payment, ['Cash', 'GCash'], true)) bookingError('Invalid payment method.');
-if ($serviceId <= 0 || $service === '' || $duration === '' || $date === '' || $time === '') {
-    bookingError('Please complete the service, duration, date, and time.');
-}
-
+$payment = trim((string)($_POST['payment_method'] ?? 'Cash'));
+$notes = trim((string)($_POST['notes'] ?? ''));
+$email = strtolower(trim((string)($_POST['email'] ?? '')));
+$rawSelections = json_decode((string)($_POST['guest_selections'] ?? '[]'), true);
 $guestNames = $_POST['guest_name'] ?? [];
 $guestPhones = $_POST['guest_phone'] ?? [];
-if (!is_array($guestNames) || count($guestNames) !== $pax || !is_array($guestPhones)) {
-    bookingError('Please provide a name for every guest and a contact number for Guest 1.');
-}
+
+if ($roomType === 'Couple Room') $pax = 2;
+if (!in_array($roomType, ['Single Room','Couple Room'], true)) bookingError('Please select a valid room type.');
+if ($pax < 1 || $pax > 4 || ($roomType === 'Couple Room' && $pax !== 2)) bookingError('Guest count must be between 1 and 4.');
+if (!in_array($payment, ['Cash','GCash'], true)) bookingError('Please select a valid payment method.');
+if (!is_array($rawSelections) || count($rawSelections) !== $pax) bookingError('Please select a service and duration for every guest.');
+if (!is_array($guestNames) || count($guestNames) !== $pax || !is_array($guestPhones)) bookingError('Please provide every guest name and Guest 1 contact number.');
+if ($email !== '' && (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 150)) bookingError('Please enter a valid email address or leave the email field blank.');
 
 $guests = [];
-for ($i = 0; $i < $pax; $i++) {
+for ($i=0; $i<$pax; $i++) {
     $name = trim((string)($guestNames[$i] ?? ''));
-    // Only Guest 1 requires a contact number; other guests may not have phone fields.
-    $phone = $i === 0 ? trim((string)($guestPhones[0] ?? '')) : '';
-    if ($name === '') {
-        bookingError('Please enter a name for every guest.');
-    }
-    if ($i === 0 && $phone === '') {
-        bookingError('Please enter Guest 1\'s contact number.');
-    }
-    $guests[] = ['name' => $name, 'phone' => $phone];
+    if (!preg_match('/^(?=.{2,100}$)[\p{L}][\p{L}\s.\'-]*$/u', $name)) bookingError('Please enter a valid full name for Guest '.($i+1).'.');
+    $phone = $i === 0 ? preg_replace('/\s+/', '', trim((string)($guestPhones[0] ?? ''))) : '';
+    if ($i === 0 && !preg_match('/^09\d{9}$/', $phone)) bookingError('Please enter Guest 1\'s valid 11-digit Philippine mobile number starting with 09.');
+    $guests[] = ['name'=>$name,'phone'=>$phone];
 }
 
 $dateObject = DateTime::createFromFormat('!Y-m-d', $date);
-if (!$dateObject || $dateObject->format('Y-m-d') !== $date) bookingError('Invalid appointment date.');
-if (!preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $time)) bookingError('Invalid time format. Please enter a time such as 2:17 PM.');
-
-$today = date('Y-m-d');
-if ($date < $today) {
-    bookingError('That appointment date has already passed. Choose today or a future date.');
-}
+$errors = DateTime::getLastErrors();
+if (!$dateObject || $dateObject->format('Y-m-d') !== $date || ($errors && ($errors['warning_count'] || $errors['error_count']))) bookingError('Please select a valid appointment date.');
+if (!preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $time)) bookingError('Please select a valid appointment time.');
+if ($date < date('Y-m-d')) bookingError('That appointment date has already passed.');
 
 $openingHour = ((int)$dateObject->format('N') >= 6) ? 13 : 15;
+$startMinute = walkinOperatingMinutes($time, $openingHour);
+$requestedTimestamp = strtotime($date . ' ' . $time);
+$previousBookingDate = (clone $dateObject)->modify('-1 day')->format('Y-m-d');
 $appointmentDate = $date;
-if ((int)substr($time, 0, 2) < $openingHour) {
-    $nextDate = clone $dateObject;
-    $nextDate->modify('+1 day');
-    $appointmentDate = $nextDate->format('Y-m-d');
+if ((int)substr($time,0,2) < $openingHour) {
+    $next = clone $dateObject; $next->modify('+1 day'); $appointmentDate = $next->format('Y-m-d');
 }
-if (strtotime($appointmentDate . ' ' . $time) <= time()) {
-    bookingError('That appointment time has already passed. Choose a future time.');
-}
+if ($startMinute === null || $requestedTimestamp === false || $requestedTimestamp <= time()) bookingError('That appointment time has already passed.');
 
+$selections=[]; $totalPrice=0.0; $maxMinutes=0; $maxDuration=''; $serviceLabels=[]; $addonLabels=[]; $assigned=[]; $assignedDuration=[];
+foreach ($rawSelections as $index=>$item) {
+    $guestNo=$index+1;
+    if (!is_array($item)) bookingError('Invalid service selection for Guest '.$guestNo.'.');
+    $serviceId=(int)($item['service_id'] ?? 0);
+    $duration=trim((string)($item['duration'] ?? ''));
+    if ($serviceId<=0 || $duration==='') bookingError('Please select a service and duration for Guest '.$guestNo.'.');
 
-$startMinute = toOperatingMinutes($time, $openingHour);
-if ($startMinute === null) bookingError('Invalid appointment time.');
-$endMinute = $startMinute + durationToMinutes($duration);
-if ($startMinute < $openingHour * 60 || $startMinute > 26 * 60 || $endMinute > 27 * 60) {
-    bookingError('The selected time is outside operating hours.');
-}
+    $serviceQuery=$conn->prepare("SELECT s.service_name,s.category,sd.duration,sd.price FROM services s INNER JOIN service_durations sd ON sd.service_id=s.id WHERE s.id=? AND s.category IN ('Massage','Package','Promo') AND sd.duration=? LIMIT 1");
+    if (!$serviceQuery) bookingError('Could not verify service selection.');
+    $serviceQuery->bind_param('is',$serviceId,$duration); $serviceQuery->execute();
+    $serviceRow=$serviceQuery->get_result()->fetch_assoc(); $serviceQuery->close();
+    if (!$serviceRow) bookingError('The selected service or duration for Guest '.$guestNo.' is no longer available.');
+    $minutes=walkinDurationMinutes($serviceRow['duration']);
+    if ($minutes<=0) bookingError('Invalid duration for Guest '.$guestNo.'.');
 
-// Recheck room availability on the server, excluding cancelled/completed bookings.
-// Match the availability endpoint: check only bookings for the same room type.
-// Single Room has capacity for 4 guests total; Couple Room is one room for 2 guests.
-$availability = $conn->prepare("SELECT booking_time, duration, pax FROM bookings WHERE booking_date = ? AND room_type = ? AND LOWER(TRIM(COALESCE(status, ''))) NOT IN ('cancelled','completed')");
-if (!$availability) bookingError('Could not verify room availability.');
-$availability->bind_param('ss', $date, $roomType);
-$availability->execute();
-$rows = $availability->get_result();
-$occupiedGuests = 0;
-$roomConflict = false;
-while ($row = $rows->fetch_assoc()) {
-    $existingTime = trim((string)$row['booking_time']);
-    // Accept stored HH:MM or HH:MM:SS values.
-    if (preg_match('/^(\d{1,2}:\d{2})(?::\d{2})?$/', $existingTime, $timeMatch)) {
-        $existingTime = $timeMatch[1];
+    $guestAddons=[]; $addonTotal=0.0;
+    $addonIds=array_values(array_unique(array_filter(array_map('intval',(array)($item['addons'] ?? [])),static fn($v)=>$v>0)));
+    foreach ($addonIds as $addonId) {
+        $addonQuery=$conn->prepare("SELECT id,service_name,price FROM services WHERE id=? AND category='Add-ons' LIMIT 1");
+        if (!$addonQuery) bookingError('Could not verify add-on selection.');
+        $addonQuery->bind_param('i',$addonId); $addonQuery->execute();
+        $addonRow=$addonQuery->get_result()->fetch_assoc(); $addonQuery->close();
+        if (!$addonRow) bookingError('An add-on selected for Guest '.$guestNo.' is no longer available.');
+        $addonPrice=(float)$addonRow['price']; $addonTotal+=$addonPrice;
+        $guestAddons[]=['id'=>(int)$addonRow['id'],'name'=>$addonRow['service_name'],'price'=>$addonPrice];
+        $addonLabels[]=$addonRow['service_name'];
     }
-    $existingStart = toOperatingMinutes($existingTime, $openingHour);
-    if ($existingStart === null) continue;
-    $existingEnd = $existingStart + durationToMinutes((string)$row['duration']);
-    $overlaps = $startMinute < $existingEnd && $endMinute > $existingStart;
-    if (!$overlaps) continue;
 
-    if ($roomType === 'Couple Room') {
-        $roomConflict = true;
+    $therapistId=(int)($item['therapist_id'] ?? 0);
+    if ($therapistId>0) {
+        $therapistQuery=$conn->prepare("SELECT id FROM therapists WHERE id=? AND status='Active' LIMIT 1");
+        if (!$therapistQuery) bookingError('Could not verify therapist selection.');
+        $therapistQuery->bind_param('i',$therapistId); $therapistQuery->execute();
+        $therapistRow=$therapistQuery->get_result()->fetch_assoc(); $therapistQuery->close();
+        if (!$therapistRow) bookingError('The selected therapist for Guest '.$guestNo.' is no longer active.');
+        if (in_array($therapistId,$assigned,true)) bookingError('Please choose a different therapist for each guest.');
+        $assigned[]=$therapistId; $assignedDuration[$therapistId]=$minutes;
+    }
+
+    $servicePrice=(float)$serviceRow['price'];
+    $totalPrice += $servicePrice + $addonTotal;
+    if ($minutes>$maxMinutes) { $maxMinutes=$minutes; $maxDuration=$serviceRow['duration']; }
+    $serviceLabels[]=$serviceRow['service_name'];
+    $selections[]=['guest_number'=>$guestNo,'service_id'=>$serviceId,'service'=>$serviceRow['service_name'],'duration'=>$serviceRow['duration'],'minutes'=>$minutes,'price'=>$servicePrice,'addons'=>$guestAddons,'therapist_id'=>$therapistId];
+}
+
+if ($maxMinutes<=0 || $startMinute+$maxMinutes>27*60) bookingError('The appointment must finish by 3:00 AM.');
+
+// Recheck room occupancy using each guest's actual service duration.
+// Couple Room is one physical room occupied until the longest guest service ends.
+// Single Room uses one room per guest, with each room released at that guest's own end time.
+$roomQueryEndDate = date('Y-m-d', $requestedTimestamp + $maxMinutes * 60);
+$roomQuery=$conn->prepare(
+    "SELECT b.id,b.booking_date,b.booking_time,b.duration AS parent_duration,
+            COALESCE(NULLIF(b.pax,0),1) AS pax,b.created_by,bg.duration AS guest_duration
+     FROM bookings b
+     LEFT JOIN booking_guests bg ON bg.booking_id=b.id
+     WHERE b.booking_date BETWEEN ? AND ? AND b.room_type=?
+       AND LOWER(TRIM(COALESCE(b.status,''))) NOT IN ('cancelled','completed')
+     ORDER BY b.id"
+);
+if (!$roomQuery) bookingError('Could not verify room availability.');
+$roomQuery->bind_param('sss',$previousBookingDate,$roomQueryEndDate,$roomType);
+$roomQuery->execute();
+$roomResult=$roomQuery->get_result();
+
+$existingBookings=[];
+while ($row=$roomResult->fetch_assoc()) {
+    $id=(int)$row['id'];
+    if (!isset($existingBookings[$id])) {
+        $existingBookings[$id]=[
+            'date'=>$row['booking_date'],
+            'time'=>$row['booking_time'],
+            'parent_duration'=>$row['parent_duration'],
+            'pax'=>max(1,(int)$row['pax']),
+            'created_by'=>strtolower(trim((string)($row['created_by'] ?? ''))),
+            'guest_durations'=>[]
+        ];
+    }
+    if (trim((string)($row['guest_duration'] ?? ''))!=='') {
+        $existingBookings[$id]['guest_durations'][]=walkinDurationMinutes($row['guest_duration']);
+    }
+}
+$roomQuery->close();
+
+// Convert all existing room occupancy into intervals measured on the operating-day clock.
+$events=[];
+foreach ($existingBookings as $booking) {
+    $existingStart=strtotime($booking['date'].' '.$booking['time']);
+    if ($existingStart===false) continue;
+
+    $durations=array_values(array_filter($booking['guest_durations'],static fn($v)=>$v>0));
+    $fallback=walkinDurationMinutes($booking['parent_duration'] ?: '1 Hour');
+    // If a legacy/partial booking has fewer guest rows than pax, account for the missing guests too.
+    while (count($durations)<$booking['pax']) $durations[]=$fallback;
+    if (!$durations) $durations=[$fallback];
+
+    if ($roomType==='Couple Room') {
+        // Two guests share one Couple Room; it remains occupied until both services finish.
+        $existingRoomMinutes=max($durations);
+        $existingPrep=$booking['created_by']==='admin'?0:15;
+        $events[]=['time'=>$existingStart,'delta'=>1,'new'=>false];
+        $events[]=['time'=>$existingStart+($existingRoomMinutes+$existingPrep)*60,'delta'=>-1,'new'=>false];
+    } else {
+        // Each Single Room guest occupies one room for that guest's own duration.
+        $existingPrep=$booking['created_by']==='admin'?0:15;
+        foreach ($durations as $guestMinutes) {
+            $events[]=['time'=>$existingStart,'delta'=>1,'new'=>false];
+            $events[]=['time'=>$existingStart+($guestMinutes+$existingPrep)*60,'delta'=>-1,'new'=>false];
+        }
+    }
+}
+
+// Add the requested walk-in intervals. No automatic preparation buffer applies to walk-ins.
+if ($roomType==='Couple Room') {
+    $events[]=['time'=>$requestedTimestamp,'delta'=>1,'new'=>true];
+    $events[]=['time'=>$requestedTimestamp+$maxMinutes*60,'delta'=>-1,'new'=>true];
+} else {
+    foreach ($selections as $selection) {
+        $guestMinutes=(int)$selection['minutes'];
+        $events[]=['time'=>$requestedTimestamp,'delta'=>1,'new'=>true];
+        $events[]=['time'=>$requestedTimestamp+$guestMinutes*60,'delta'=>-1,'new'=>true];
+    }
+}
+
+// End events (-1) are processed before start events (+1) at the same minute,
+// allowing a room to be reused immediately when the previous service ends.
+usort($events,static function($a,$b) {
+    if ($a['time']!==$b['time']) return $a['time']<=>$b['time'];
+    return $a['delta']<=>$b['delta'];
+});
+
+$occupiedRooms=0;
+$newBookingActive=0;
+$roomConflict=false;
+$capacity=$roomType==='Couple Room'?1:4;
+foreach ($events as $event) {
+    $occupiedRooms += $event['delta'];
+    if ($event['new']) $newBookingActive += $event['delta'];
+    if ($occupiedRooms>$capacity && $newBookingActive>0) {
+        $roomConflict=true;
         break;
     }
-    $occupiedGuests += max(1, (int)$row['pax']);
 }
-$availability->close();
-if ($roomConflict || ($roomType === 'Single Room' && $occupiedGuests + $pax > 4)) {
-    bookingError('That time is no longer available. Please choose another time.');
+if ($roomConflict) {
+    bookingError('That time overlaps another appointment or exceeds the available room capacity. Please choose another time.');
 }
 
-// Use the selected duration's database price, not the browser-submitted price.
-$priceQuery = $conn->prepare('SELECT price FROM service_durations WHERE service_id = ? AND duration = ? LIMIT 1');
-if (!$priceQuery) bookingError('Could not verify service pricing.');
-$priceQuery->bind_param('is', $serviceId, $duration);
-$priceQuery->execute();
-$priceRow = $priceQuery->get_result()->fetch_assoc();
-$priceQuery->close();
-if (!$priceRow) bookingError('The selected service duration was not found. Please select it again.');
-$totalPrice = (float)$priceRow['price'] * $pax; // Service price is charged per guest.
-
-if ($addons !== '') {
-    $addonNames = array_values(array_unique(array_filter(array_map('trim', explode(',', $addons)), static fn($v) => $v !== '')));
-    foreach ($addonNames as $addonName) {
-        $addonQuery = $conn->prepare("SELECT price FROM services WHERE service_name = ? AND category = 'Add-ons' LIMIT 1");
-        if (!$addonQuery) bookingError('Could not verify add-on pricing.');
-        $addonQuery->bind_param('s', $addonName);
-        $addonQuery->execute();
-        $addonRow = $addonQuery->get_result()->fetch_assoc();
-        $addonQuery->close();
-        if (!$addonRow) bookingError('An add-on could not be verified. Please select the add-ons again.');
-        $totalPrice += (float)$addonRow['price'] * $pax; // Add-ons are also charged per guest.
+// Validate therapist conflicts against both current guest-level assignments and legacy parent assignments.
+if ($assigned) {
+    $conflict=false;
+    $q=$conn->prepare("SELECT bt.therapist_id,b.booking_date,b.booking_time,b.duration AS parent_duration,bg.duration AS guest_duration FROM booking_therapists bt INNER JOIN bookings b ON b.id=bt.booking_id LEFT JOIN booking_guests bg ON bg.id=bt.booking_guest_id WHERE b.booking_date BETWEEN ? AND ? AND LOWER(TRIM(COALESCE(b.status,''))) NOT IN ('cancelled','completed')");
+    if ($q) {
+        $therapistQueryEndDate = date('Y-m-d', $requestedTimestamp + $maxMinutes * 60);
+        $q->bind_param('ss',$previousBookingDate,$therapistQueryEndDate); $q->execute(); $result=$q->get_result();
+        while ($row=$result->fetch_assoc()) {
+            $tid=(int)$row['therapist_id']; if (!isset($assignedDuration[$tid])) continue;
+            $busyStart=strtotime($row['booking_date'].' '.$row['booking_time']); $busyDuration=walkinDurationMinutes($row['guest_duration'] ?: $row['parent_duration']);
+            if ($busyStart!==false && $requestedTimestamp < $busyStart+$busyDuration*60 && $busyStart < $requestedTimestamp+$assignedDuration[$tid]*60) { $conflict=true; break; }
+        }
+        $q->close();
     }
+    if (!$conflict) {
+        $q=$conn->prepare("SELECT therapist_id,booking_date,booking_time,duration FROM bookings WHERE booking_date BETWEEN ? AND ? AND LOWER(TRIM(COALESCE(status,''))) NOT IN ('cancelled','completed') AND therapist_id>0 AND NOT EXISTS (SELECT 1 FROM booking_therapists bt_old WHERE bt_old.booking_id=bookings.id)");
+        if ($q) {
+            $therapistQueryEndDate = date('Y-m-d', $requestedTimestamp + $maxMinutes * 60);
+        $q->bind_param('ss',$previousBookingDate,$therapistQueryEndDate); $q->execute(); $result=$q->get_result();
+            while ($row=$result->fetch_assoc()) {
+                $tid=(int)$row['therapist_id']; if (!isset($assignedDuration[$tid])) continue;
+                $busyStart=strtotime($row['booking_date'].' '.$row['booking_time']); $busyDuration=walkinDurationMinutes($row['duration']);
+                if ($busyStart!==false && $requestedTimestamp < $busyStart+$busyDuration*60 && $busyStart < $requestedTimestamp+$assignedDuration[$tid]*60) { $conflict=true; break; }
+            }
+            $q->close();
+        }
+    }
+    if ($conflict) bookingError('One or more selected therapists are no longer available for this schedule.');
 }
 
-$customerName = $guests[0]['name'];
-$phone = $guests[0]['phone'];
-$status = 'Confirmed';
-$createdBy = 'admin';
+$customerName=$guests[0]['name']; $phone=$guests[0]['phone'];
+$serviceSummary=($pax===1?'Individual Booking':($roomType==='Couple Room'?'Couple Booking':'Group Booking ('.$pax.' guests)'));
+$durationSummary=$maxDuration;
+$addonsSummary=implode(', ',array_values(array_unique($addonLabels)));
+$primaryTherapist=$assigned[0] ?? 0;
+$status='Confirmed'; $createdBy='admin';
 
 $conn->begin_transaction();
 try {
-    $insert = $conn->prepare("INSERT INTO bookings (service_id, service, duration, price, customer_name, phone, booking_date, booking_time, pax, payment_method, notes, addons, therapist_id, room_type, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    $insert=$conn->prepare("INSERT INTO bookings (service,duration,price,customer_name,phone,email,booking_date,booking_time,pax,payment_method,notes,addons,therapist_id,room_type,status,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     if (!$insert) throw new Exception($conn->error);
-    $insert->bind_param('issdssssisssisss', $serviceId, $service, $duration, $totalPrice, $customerName, $phone, $date, $time, $pax, $payment, $notes, $addons, $therapistId, $roomType, $status, $createdBy);
+    $insert->bind_param('ssdsssssisssisss',$serviceSummary,$durationSummary,$totalPrice,$customerName,$phone,$email,$date,$time,$pax,$payment,$notes,$addonsSummary,$primaryTherapist,$roomType,$status,$createdBy);
     if (!$insert->execute()) throw new Exception($insert->error);
-    $bookingId = $insert->insert_id;
-    $insert->close();
+    $bookingId=$insert->insert_id; $insert->close();
 
-    $guestInsert = $conn->prepare('INSERT INTO booking_guests (booking_id, guest_number, guest_name, phone) VALUES (?, ?, ?, ?)');
-    if (!$guestInsert) throw new Exception('Could not save guest details. Check that the booking_guests table exists.');
-    foreach ($guests as $index => $guest) {
-        $guestNumber = $index + 1;
-        $guestInsert->bind_param('iiss', $bookingId, $guestNumber, $guest['name'], $guest['phone']);
+    $guestInsert=$conn->prepare('INSERT INTO booking_guests (booking_id,guest_number,guest_name,service_id,service,duration,price,addons,therapist_id) VALUES (?,?,?,?,?,?,?,?,?)');
+    if (!$guestInsert) throw new Exception($conn->error);
+    foreach ($selections as $i=>$selection) {
+        $guestNumber=$selection['guest_number']; $guestName=$guests[$i]['name']; $sid=$selection['service_id'];
+        $guestService=$selection['service']; $guestDuration=$selection['duration']; $guestPrice=$selection['price'];
+        $guestAddonNames=implode(', ',array_column($selection['addons'],'name')); $guestTherapist=$selection['therapist_id']; $guestPhone=$phone;
+        $guestInsert->bind_param('iisissdsi',$bookingId,$guestNumber,$guestName,$sid,$guestService,$guestDuration,$guestPrice,$guestAddonNames,$guestTherapist);
         if (!$guestInsert->execute()) throw new Exception($guestInsert->error);
+        $guestRowId=$guestInsert->insert_id;
+
+        foreach ($selection['addons'] as $addon) {
+            $addonInsert=$conn->prepare('INSERT INTO booking_guest_addons (booking_guest_id,addon_service_id,addon_name,quantity,price) VALUES (?,?,?,1,?)');
+            if (!$addonInsert) throw new Exception($conn->error);
+            $addonId=$addon['id']; $addonName=$addon['name']; $addonPrice=$addon['price'];
+            $addonInsert->bind_param('iisd',$guestRowId,$addonId,$addonName,$addonPrice);
+            if (!$addonInsert->execute()) throw new Exception($addonInsert->error);
+            $addonInsert->close();
+        }
+
+        if ($guestTherapist>0) {
+            $map=$conn->prepare("INSERT INTO booking_therapists (booking_id,booking_guest_id,therapist_id,assigned_by,source,action_by) VALUES (?,?,?,'admin','admin','admin')");
+            if (!$map) throw new Exception($conn->error);
+            $map->bind_param('iii',$bookingId,$guestRowId,$guestTherapist);
+            if (!$map->execute()) throw new Exception($map->error);
+            $map->close();
+        }
     }
     $guestInsert->close();
-
-    if ($therapistIds) {
-        $map = $conn->prepare("INSERT INTO booking_therapists (booking_id, therapist_id, assigned_by) VALUES (?, ?, 'admin')");
-        if (!$map) throw new Exception($conn->error);
-        foreach ($therapistIds as $assignedTherapistId) {
-            $map->bind_param('ii', $bookingId, $assignedTherapistId);
-            if (!$map->execute()) throw new Exception($map->error);
-        }
-        $map->close();
-    }
-
     $conn->commit();
-    header('Location: bookings.php?success=1&id=' . $bookingId);
-    exit;
 } catch (Throwable $error) {
     $conn->rollback();
-    error_log('Admin walk-in save error: ' . $error->getMessage());
+    error_log('Admin walk-in save error: '.$error->getMessage());
     bookingError('The booking could not be saved. Please check the details and try again.');
 }
+
+// Email is optional for walk-ins. A mail failure must never undo a confirmed booking.
+if ($email !== '') {
+    try {
+        require_once __DIR__ . '/../includes/mailer.php';
+        if (function_exists('mizpahSendBookingEmails')) {
+            $mailGuests=[];
+            foreach ($selections as $i=>$selection) {
+                $mailGuests[]=['guest_number'=>$selection['guest_number'],'name'=>$guests[$i]['name'],'service'=>$selection['service'],'duration'=>$selection['duration'],'price'=>$selection['price'],'addons'=>$selection['addons']];
+            }
+            mizpahSendBookingEmails(['id'=>$bookingId,'customer_name'=>$customerName,'phone'=>$phone,'email'=>$email,'booking_date'=>$date,'booking_time'=>$time,'pax'=>$pax,'payment_method'=>$payment,'price'=>$totalPrice,'guests'=>$mailGuests,'notes'=>$notes]);
+        } else {
+            error_log('Mizpah mailer is missing mizpahSendBookingEmails().');
+        }
+    } catch (Throwable $mailError) {
+        error_log('Mizpah walk-in confirmation email error: '.$mailError->getMessage());
+    }
+}
+
+header('Location: bookings.php?success=1&id='.$bookingId.($email!==''?'&email=1':''));
+exit;
 ?>

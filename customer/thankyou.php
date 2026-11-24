@@ -1,3 +1,4 @@
+
 <?php
 session_start();
 require_once __DIR__ . '/../includes/db.php';
@@ -28,14 +29,45 @@ if ($id > 0 && isset($conn) && $conn) {
     }
 }
 
-/* Only show a booking belonging to the logged-in customer, if user_id is available. */
+$guestDetails = [];
 if (
     $data &&
-    isset($_SESSION['user_id']) &&
-    isset($data['user_id']) &&
-    (int)$data['user_id'] !== (int)$_SESSION['user_id']
+    (!isset($_SESSION['user_id']) || !isset($data['user_id']) || (int)$data['user_id'] !== (int)$_SESSION['user_id'])
 ) {
     $data = null;
+}
+
+if ($id > 0 && $data) {
+    $guestStmt = mysqli_prepare($conn, "SELECT guest_number, guest_name, service, duration, price, addons FROM booking_guests WHERE booking_id = ? ORDER BY guest_number ASC");
+    if ($guestStmt) {
+        mysqli_stmt_bind_param($guestStmt, 'i', $id);
+        mysqli_stmt_execute($guestStmt);
+        $guestResult = mysqli_stmt_get_result($guestStmt);
+        while ($guestRow = mysqli_fetch_assoc($guestResult)) $guestDetails[] = $guestRow;
+        mysqli_stmt_close($guestStmt);
+    }
+}
+
+// Use each guest's saved price so group bookings show the combined amount.
+$totalBookingPrice = (float)($data['price'] ?? 0);
+if (!empty($guestDetails)) {
+    $guestPriceTotal = 0;
+    foreach ($guestDetails as $guestDetail) {
+        $guestPriceTotal += (float)($guestDetail['price'] ?? 0);
+    }
+    if ($guestPriceTotal > 0) {
+        $totalBookingPrice = $guestPriceTotal;
+    }
+}
+
+$bookingType = 'Individual Booking';
+if ($data) {
+    $guestCount = max(1, (int)($data['pax'] ?? 1));
+    if (($data['room_type'] ?? '') === 'Couple Room' && $guestCount === 2) {
+        $bookingType = 'Couple Booking';
+    } elseif ($guestCount > 1) {
+        $bookingType = 'Group Booking';
+    }
 }
 
 $formattedDate = 'Not specified';
@@ -223,10 +255,6 @@ if (!empty($data['booking_time'])) {
             overflow-wrap: anywhere;
         }
 
-        .status-value {
-            color: var(--gold);
-        }
-
         .price-row {
             display: flex;
             align-items: center;
@@ -275,6 +303,23 @@ if (!empty($data['booking_time'])) {
             font-size: 11px;
             line-height: 1.8;
             text-align: left;
+        }
+
+        .screenshot-note {
+            margin-top: 14px;
+            padding: 11px 12px;
+            border: 1px solid var(--gold-border);
+            border-radius: 8px;
+            background: rgba(214, 194, 156, 0.045);
+            color: var(--muted);
+            font-size: 10px;
+            line-height: 1.7;
+            text-align: center;
+        }
+
+        .screenshot-note strong {
+            color: var(--gold);
+            font-weight: 600;
         }
 
         .btn {
@@ -353,16 +398,29 @@ if (!empty($data['booking_time'])) {
             <h2 class="section-title">Your Booking Details</h2>
 
             <section class="service">
-                <p class="service-label">Selected Service</p>
+                <p class="service-label">Booking Type</p>
 
                 <h2 class="service-name">
-                    <?= thankyouEscape($data['service']) ?>
+                    <?= thankyouEscape($bookingType) ?>
                 </h2>
 
                 <p class="service-duration">
-                    Duration: <?= thankyouEscape($data['duration']) ?>
+                    Room: <?= thankyouEscape($data['room_type'] ?? 'Not specified') ?>
                 </p>
             </section>
+
+            <?php if (!empty($guestDetails)): ?>
+                <h2 class="section-title" style="margin-top:18px;">Individual Guest Services</h2>
+                <?php foreach ($guestDetails as $guestDetail): ?>
+                    <section class="service">
+                        <p class="service-label">Guest <?= thankyouEscape($guestDetail['guest_number']) ?> — <?= thankyouEscape($guestDetail['guest_name']) ?></p>
+                        <h2 class="service-name"><?= thankyouEscape($guestDetail['service']) ?></h2>
+                        <p class="service-duration">Duration: <?= thankyouEscape($guestDetail['duration']) ?></p>
+                        <p class="service-duration">Price: ₱<?= number_format((float)($guestDetail['price'] ?? 0), 2) ?></p>
+                        <?php if (!empty($guestDetail['addons'])): ?><p class="service-duration">Add-ons: <?= thankyouEscape($guestDetail['addons']) ?></p><?php endif; ?>
+                    </section>
+                <?php endforeach; ?>
+            <?php endif; ?>
 
             <div class="row">
                 <span class="label">Name</span>
@@ -386,6 +444,20 @@ if (!empty($data['booking_time'])) {
             </div>
 
             <div class="row">
+                <span class="label">Phone</span>
+                <span class="value">
+                    <?= thankyouEscape($data['phone']) ?>
+                </span>
+            </div>
+
+            <?php if (!empty($data['email'])): ?>
+                <div class="row">
+                    <span class="label">Email</span>
+                    <span class="value"><?= thankyouEscape($data['email']) ?></span>
+                </div>
+            <?php endif; ?>
+
+            <div class="row">
                 <span class="label">Guests</span>
                 <span class="value">
                     <?= thankyouEscape($data['pax']) ?>
@@ -399,13 +471,6 @@ if (!empty($data['booking_time'])) {
                 </span>
             </div>
 
-            <div class="row">
-                <span class="label">Status</span>
-                <span class="value status-value">
-                    <?= thankyouEscape($data['status']) ?>
-                </span>
-            </div>
-
             <div class="price-row">
                 <div>
                     <p class="price-label">Total Booking Price</p>
@@ -415,8 +480,13 @@ if (!empty($data['booking_time'])) {
                 </div>
 
                 <div class="price">
-                    ₱<?= number_format((float)($data['price'] ?? 0), 2) ?>
+                    ₱<?= number_format($totalBookingPrice, 2) ?>
                 </div>
+            </div>
+
+            <div class="screenshot-note">
+                <strong>Important:</strong> Please take a screenshot of this booking confirmation
+                and keep it for your reference. You may present it to our staff when you arrive.
             </div>
 
             <?php if (!empty($data['notes'])): ?>
@@ -428,7 +498,7 @@ if (!empty($data['booking_time'])) {
                 </div>
             <?php endif; ?>
 
-            <a href="dashboard.php" class="btn">Back to Dashboard</a>
+            <a href="dashboard.php" class="btn">Back to Home</a>
 
         <?php else: ?>
 
@@ -440,11 +510,11 @@ if (!empty($data['booking_time'])) {
 
                 <p class="sub">
                     We couldn't find a booking associated with this reference.
-                    Please return to your dashboard and check your booking details.
+                    Please return to the homepage and check your booking details.
                 </p>
             </header>
 
-            <a href="dashboard.php" class="btn">Back to Dashboard</a>
+            <a href="dashboard.php" class="btn">Back to Home</a>
 
         <?php endif; ?>
 

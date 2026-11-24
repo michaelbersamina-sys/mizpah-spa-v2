@@ -1,6 +1,7 @@
 <?php
 
 session_start();
+date_default_timezone_set('Asia/Manila');
 include '../includes/db.php';
 
 /** @var mysqli $conn */
@@ -21,6 +22,108 @@ if(!isset($_SESSION['user_id'])){
 }
 
 $user_id = (int)$_SESSION['user_id'];
+
+/** Return the appointment's actual start timestamp. Booking times may be stored
+ *  as a range (for example, 09:00 AM - 10:00 AM), so parse only the start time.
+ */
+function mizpahBookingStartTimestamp($bookingDate, $bookingTime) {
+    $bookingDate = trim((string)$bookingDate);
+    $bookingTime = trim((string)$bookingTime);
+    if ($bookingDate === '' || $bookingTime === '') return false;
+
+    $parts = preg_split('/\s*(?:-|–|—|\bto\b)\s*/iu', $bookingTime, 2);
+    $startTime = trim($parts[0] ?? $bookingTime);
+    if ($startTime === '') return false;
+
+    $timestamp = strtotime($bookingDate . ' ' . $startTime);
+    return $timestamp ?: false;
+}
+
+// Customer cancellation is allowed only until 1 hour before the appointment starts.
+$bookingActionMessage = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['cancel_booking'])) {
+    $cancelId = (int)($_POST['booking_id'] ?? 0);
+    $reason = trim((string)($_POST['cancellation_reason'] ?? ''));
+    if ($cancelId > 0) {
+        if ($reason === '') {
+            $bookingActionMessage = 'Please provide a reason for cancelling this booking.';
+        } else {
+        $find = $conn->prepare("SELECT * FROM bookings WHERE id = ? AND user_id = ? LIMIT 1");
+        if ($find) {
+            $find->bind_param('ii', $cancelId, $user_id);
+            $find->execute();
+            $row = $find->get_result()->fetch_assoc();
+            $find->close();
+            if (!$row) {
+                $bookingActionMessage = 'Booking not found.';
+            } elseif (in_array(strtolower(trim((string)$row['status'])), ['completed','cancelled','canceled'], true)) {
+                $bookingActionMessage = 'This booking can no longer be cancelled.';
+            } else {
+                $appointmentTime = mizpahBookingStartTimestamp($row['booking_date'] ?? '', $row['booking_time'] ?? '');
+                if (!$appointmentTime || time() > ($appointmentTime - 3600)) {
+                    $bookingActionMessage = 'Bookings can only be cancelled at least 1 hour before the appointment.';
+                } else {
+                    $reason = mb_substr($reason, 0, 1000);
+                    $upd = $conn->prepare("UPDATE bookings SET status = 'Cancelled', cancellation_reason = ? WHERE id = ? AND user_id = ? AND status NOT IN ('Completed','Cancelled')");
+                    if ($upd) {
+                        $upd->bind_param('sii', $reason, $cancelId, $user_id);
+                        $upd->execute();
+                        $changed = $upd->affected_rows;
+                        $upd->close();
+                        if ($changed > 0) {
+                            $title = 'Booking cancelled';
+                            $message = 'Your booking #' . $cancelId . ' has been cancelled successfully.';
+                            $kind = 'booking_cancelled';
+                            $n = $conn->prepare("INSERT INTO customer_notifications (user_id, booking_id, title, message, notification_type) VALUES (?, ?, ?, ?, ?)");
+                            if ($n) { $n->bind_param('iisss', $user_id, $cancelId, $title, $message, $kind); $n->execute(); $n->close(); }
+
+                            // Send the same cancellation status email used by the admin workflow.
+                            // Account customers receive this automatically when they cancel their own booking.
+                            $customerEmail = trim((string)($row['email'] ?? ''));
+                            if (filter_var($customerEmail, FILTER_VALIDATE_EMAIL)) {
+                                try {
+                                    require_once __DIR__ . '/../includes/mailer.php';
+                                    if (function_exists('mizpahSendBookingStatusEmail')) {
+                                        mizpahSendBookingStatusEmail($row, 'Cancelled', $reason);
+                                    } else {
+                                        error_log('Mizpah mailer is missing mizpahSendBookingStatusEmail().');
+                                    }
+                                } catch (Throwable $mailError) {
+                                    error_log('Mizpah customer cancellation email error: ' . $mailError->getMessage());
+                                }
+                            } else {
+                                error_log('Mizpah customer cancellation email skipped: invalid or missing booking email for booking #' . $cancelId);
+                            }
+
+                            $bookingActionMessage = 'Your booking has been cancelled.';
+                        } else {
+                            $bookingActionMessage = 'The booking could not be cancelled. Please refresh and try again.';
+                        }
+                    }
+                }
+            }
+        }
+        }
+    }
+}
+
+// Load recent in-app notifications for this customer.
+$customerNotifications = [];
+$unreadNotifications = 0;
+$notificationStmt = $conn->prepare("SELECT id, booking_id, title, message, is_read, created_at FROM customer_notifications WHERE user_id = ? ORDER BY id DESC LIMIT 10");
+if ($notificationStmt) {
+    $notificationStmt->bind_param('i', $user_id);
+    $notificationStmt->execute();
+    $notificationResult = $notificationStmt->get_result();
+    while ($notificationRow = $notificationResult->fetch_assoc()) {
+        $customerNotifications[] = $notificationRow;
+        if ((int)$notificationRow['is_read'] === 0) $unreadNotifications++;
+    }
+    $notificationStmt->close();
+}
+// Mark visible notifications as read when the page is opened.
+$markRead = $conn->prepare("UPDATE customer_notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0");
+if ($markRead) { $markRead->bind_param('i', $user_id); $markRead->execute(); $markRead->close(); }
 
 
 /* =========================
@@ -188,6 +291,36 @@ nav a.active{
     opacity:1;
 
 }
+
+.notification-wrap{position:relative;display:inline-flex;align-items:center}
+.notification-toggle{position:relative;border:1px solid rgba(214,194,156,.35);background:#171512;color:#D6C29C;border-radius:20px;padding:8px 12px;font-size:12px;cursor:pointer}
+.notification-count{display:inline-flex;align-items:center;justify-content:center;min-width:17px;height:17px;border-radius:50%;background:#b88b4a;color:#111;font-size:10px;font-weight:700;margin-left:5px}
+.notification-panel{display:none;position:absolute;right:0;top:42px;width:min(340px,85vw);max-height:360px;overflow:auto;background:#171512;border:1px solid rgba(214,194,156,.28);border-radius:12px;padding:12px;box-shadow:0 15px 40px #000;z-index:200}
+.notification-wrap:focus-within .notification-panel,.notification-wrap:hover .notification-panel{display:block}
+.notification-item{padding:10px;border-bottom:1px solid rgba(255,255,255,.08);font-size:11px;color:#c9c0b1;line-height:1.6}
+.notification-item:last-child{border:0}.notification-item strong{display:block;color:#e2c99c;font-size:12px}
+.action-message{margin:0 0 18px;padding:12px 15px;border:1px solid rgba(214,194,156,.3);border-radius:9px;color:#e6d3ad;background:rgba(214,194,156,.08);font-size:12px}
+.cancel-booking-form{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap}
+.btn-cancel{display:inline-block;padding:9px 13px;border-radius:8px;border:1px solid #925047;background:#572a25;color:#fff;font:11px Poppins,sans-serif;cursor:pointer;transition:.2s ease}
+.btn-cancel:hover{background:#71362f;transform:translateY(-1px)}
+.customer-cancel-backdrop{position:fixed;inset:0;z-index:99999;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(0,0,0,.78);backdrop-filter:blur(5px)}
+.customer-cancel-backdrop.is-visible{display:flex}
+.customer-cancel-dialog{width:100%;max-width:420px;padding:27px 25px 23px;background:linear-gradient(145deg,#1b1a17,#10100f);border:1px solid rgba(214,194,156,.35);border-radius:17px;box-shadow:0 22px 70px rgba(0,0,0,.65);animation:mizpahCancelIn .18s ease-out}
+.customer-cancel-icon{width:46px;height:46px;margin:0 auto 13px;display:flex;align-items:center;justify-content:center;border:1px solid rgba(191,112,96,.6);border-radius:50%;color:#e0a093;background:rgba(191,112,96,.10);font-size:22px}
+.customer-cancel-dialog h2{margin:0 0 8px;text-align:center;color:#D6C29C;font-family:'Playfair Display',serif;font-size:21px;font-weight:600}
+.customer-cancel-dialog .cancel-intro{margin:0 0 17px;text-align:center;color:#c4c0b8;font-size:11px;line-height:1.7}
+.customer-cancel-dialog label{display:block;margin:0 0 7px;color:#e1d3b8;font-size:11px;font-weight:600}
+.customer-cancel-dialog textarea{display:block;width:100%;min-height:112px;resize:vertical;padding:12px;border:1px solid rgba(214,194,156,.32);border-radius:9px;outline:none;background:#12110f;color:#f4eee4;font:11px Poppins,sans-serif;line-height:1.6;box-sizing:border-box}
+.customer-cancel-dialog textarea:focus{border-color:#D6C29C;box-shadow:0 0 0 2px rgba(214,194,156,.10)}
+.customer-cancel-dialog textarea::placeholder{color:#817b70}
+.customer-cancel-note{margin:8px 0 0;color:#938b7e;font-size:10px;line-height:1.5}
+.customer-cancel-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:20px}
+.customer-cancel-actions button{padding:10px 15px;border-radius:8px;font:600 10px Poppins,sans-serif;cursor:pointer;transition:.2s ease}
+.customer-cancel-back{border:1px solid rgba(214,194,156,.3);background:transparent;color:#d9c9aa}
+.customer-cancel-confirm{border:1px solid #925047;background:#572a25;color:#fff}
+.customer-cancel-confirm:hover{background:#71362f}
+@keyframes mizpahCancelIn{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
+@media(max-width:480px){.customer-cancel-dialog{padding:24px 19px 20px}.customer-cancel-dialog h2{font-size:19px}.customer-cancel-actions{flex-direction:column-reverse}.customer-cancel-actions button{width:100%}}
 
 .profile-mini{
 
@@ -927,6 +1060,16 @@ nav a.active{
             Profile
         </a>
 
+        <div class="notification-wrap">
+            <button type="button" class="notification-toggle" aria-label="Notifications">Notifications<?php if ($unreadNotifications > 0): ?><span class="notification-count"><?= $unreadNotifications ?></span><?php endif; ?></button>
+            <div class="notification-panel">
+                <strong style="color:#D6C29C;font-size:12px;display:block;padding:5px 9px 9px;">Recent Notifications</strong>
+                <?php if (!$customerNotifications): ?><div class="notification-item">No notifications yet.</div><?php else: foreach ($customerNotifications as $notice): ?>
+                    <div class="notification-item"><strong><?= htmlspecialchars($notice['title']) ?></strong><?= htmlspecialchars($notice['message']) ?><div style="opacity:.55;font-size:10px;"><?= htmlspecialchars(date('M j, Y g:i A', strtotime($notice['created_at']))) ?></div></div>
+                <?php endforeach; endif; ?>
+            </div>
+        </div>
+
         <a href="logout.php">
             Logout
         </a>
@@ -947,6 +1090,8 @@ nav a.active{
 ========================= -->
 
 <div class="wrap">
+
+    <?php if ($bookingActionMessage !== ''): ?><div class="action-message"><?= htmlspecialchars($bookingActionMessage) ?></div><?php endif; ?>
 
 
     <!-- PAGE HEADER -->
@@ -1026,15 +1171,11 @@ nav a.active{
            STATUS
         ========================= */
 
-        // Use the latest available status field and normalize spacing/case.
-        // The page should display the status saved by the admin in the database.
-        $rawStatus = '';
-
-        if (isset($b['booking_status']) && trim((string)$b['booking_status']) !== '') {
-            $rawStatus = (string)$b['booking_status'];
-        } else {
-            $rawStatus = (string)($b['status'] ?? 'Pending');
-        }
+        // The booking workflow writes and updates bookings.status.
+        // Use it as the source of truth; booking_status is only a legacy fallback.
+        $rawStatus = (isset($b['status']) && trim((string)$b['status']) !== '')
+            ? (string)$b['status']
+            : (string)($b['booking_status'] ?? 'Pending');
 
         $status = strtolower(trim($rawStatus));
 
@@ -1207,12 +1348,14 @@ nav a.active{
                             $b['booking_time']
                         )){
 
-                            echo date(
-                                'g:i A',
-                                strtotime(
-                                    $b['booking_time']
-                                )
+                            $bookingStartForDisplay = mizpahBookingStartTimestamp(
+                                $b['booking_date'] ?? '',
+                                $b['booking_time']
                             );
+
+                            echo $bookingStartForDisplay
+                                ? date('g:i A', $bookingStartForDisplay)
+                                : htmlspecialchars($b['booking_time']);
 
                         }else{
 
@@ -1534,6 +1677,18 @@ nav a.active{
                     <?php endif; ?>
 
 
+                    <!-- CUSTOMER CANCEL: allowed until 1 hour before appointment; final statuses are locked -->
+                    <?php
+                    $canCancel = !in_array($status, ['completed','cancelled'], true);
+                    $bookingStart = mizpahBookingStartTimestamp($b['booking_date'] ?? '', $b['booking_time'] ?? '');
+                    $canCancel = $canCancel && $bookingStart && time() <= ($bookingStart - 3600);
+                    ?>
+                    <?php if ($canCancel): ?>
+                        <div class="cancel-booking-form">
+                            <button type="button" class="btn-cancel" onclick="openCustomerCancelDialog(<?= (int)$booking_id ?>)">Cancel Booking</button>
+                        </div>
+                    <?php endif; ?>
+
                     <!-- BOOK AGAIN -->
 
                     <a
@@ -1558,6 +1713,64 @@ nav a.active{
 
 </div>
 
+
+
+<div class="customer-cancel-backdrop" id="customerCancelBackdrop" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="customerCancelTitle" onclick="if(event.target===this)closeCustomerCancelDialog()">
+    <div class="customer-cancel-dialog">
+        <div class="customer-cancel-icon" aria-hidden="true">!</div>
+        <h2 id="customerCancelTitle">Cancel Booking</h2>
+        <p class="cancel-intro">Are you sure you want to cancel this appointment? Please tell us why so our team can properly record your request.</p>
+        <form method="POST" id="customerCancelForm">
+            <input type="hidden" name="booking_id" id="customerCancelBookingId" value="">
+            <input type="hidden" name="cancel_booking" value="1">
+            <label for="customerCancellationReason">Reason for cancellation</label>
+            <textarea name="cancellation_reason" id="customerCancellationReason" maxlength="1000" required placeholder="Please enter your reason..."></textarea>
+            <p class="customer-cancel-note">Your reason will be visible to the Mizpah admin team. Cancellation is allowed until 1 hour before your appointment.</p>
+            <div class="customer-cancel-actions">
+                <button type="button" class="customer-cancel-back" onclick="closeCustomerCancelDialog()">Go Back</button>
+                <button type="submit" class="customer-cancel-confirm">Confirm Cancellation</button>
+            </div>
+        </form>
+    </div>
+</div>
+<script>
+(function(){
+    const backdrop = document.getElementById('customerCancelBackdrop');
+    const bookingInput = document.getElementById('customerCancelBookingId');
+    const reasonInput = document.getElementById('customerCancellationReason');
+    let previousFocus = null;
+    window.openCustomerCancelDialog = function(bookingId){
+        if(!backdrop || !bookingInput || !reasonInput) return;
+        previousFocus = document.activeElement;
+        bookingInput.value = String(bookingId);
+        reasonInput.value = '';
+        backdrop.classList.add('is-visible');
+        backdrop.setAttribute('aria-hidden','false');
+        setTimeout(function(){reasonInput.focus();},80);
+    };
+    window.closeCustomerCancelDialog = function(){
+        if(!backdrop) return;
+        backdrop.classList.remove('is-visible');
+        backdrop.setAttribute('aria-hidden','true');
+        if(previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
+    };
+    document.addEventListener('keydown',function(event){
+        if(event.key === 'Escape' && backdrop && backdrop.classList.contains('is-visible')) window.closeCustomerCancelDialog();
+    });
+    if(reasonInput){
+        document.getElementById('customerCancelForm').addEventListener('submit',function(event){
+            if(!reasonInput.value.trim()){
+                event.preventDefault();
+                reasonInput.setCustomValidity('Please enter your reason for cancellation.');
+                reasonInput.reportValidity();
+            } else {
+                reasonInput.setCustomValidity('');
+            }
+        });
+        reasonInput.addEventListener('input',function(){reasonInput.setCustomValidity('');});
+    }
+})();
+</script>
 
 </body>
 </html>

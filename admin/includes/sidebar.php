@@ -1,4 +1,8 @@
-<div class="sidebar">
+<button class="sidebar-toggle" onclick="toggleSidebar()" aria-label="Toggle Menu">
+    ☰
+</button>
+
+<div class="sidebar" id="adminSidebar">
 
     <style>
     .sidebar {
@@ -9,14 +13,11 @@
         left: 0;
         top: 0;
         padding: 20px 15px;
-
-        /* ✅ still scrollable but hidden scrollbar */
         overflow-y: auto;
-        scrollbar-width: none; /* Firefox */
-        -ms-overflow-style: none; /* IE/Edge */
+        scrollbar-width: none;
+        -ms-overflow-style: none;
     }
 
-    /* Chrome / Safari scrollbar hide */
     .sidebar::-webkit-scrollbar {
         display: none;
     }
@@ -31,11 +32,8 @@
         width: 75px;
         height: 75px;
         object-fit: contain;
-
-        /* 🔥 BRIGHTER LOGO */
         filter: brightness(1.6) contrast(1.3)
                 drop-shadow(0 0 10px rgba(214,194,156,0.5));
-
         border-radius: 10px;
     }
 
@@ -88,6 +86,39 @@
         background: rgba(255,107,107,0.1) !important;
         color: #ff6b6b !important;
     }
+
+    /* MOBILE SIDEBAR ONLY */
+    .sidebar-toggle {
+        display: none;
+    }
+
+    @media (max-width: 768px) {
+        .sidebar {
+            transform: translateX(-100%);
+            transition: transform 0.3s ease;
+            z-index: 1000;
+        }
+
+        .sidebar.sidebar-open {
+            transform: translateX(0);
+        }
+
+        .sidebar-toggle {
+            display: block;
+            position: fixed;
+            top: 15px;
+            left: 15px;
+            z-index: 1001;
+            width: 42px;
+            height: 42px;
+            border: 1px solid rgba(214,194,156,0.3);
+            border-radius: 8px;
+            background: #0b0b0b;
+            color: #D6C29C;
+            font-size: 22px;
+            cursor: pointer;
+        }
+    }
     </style>
 
     <!-- BRAND -->
@@ -97,7 +128,6 @@
         <span class="role-label">Administrator Panel</span>
     </div>
 
-
     <div class="menu-group">
         <div class="menu-title">Booking</div>
         <a href="walkin-booking.php">Walk-in Booking</a>
@@ -106,7 +136,6 @@
     <!-- MAIN -->
     <div class="menu-group">
         <div class="menu-title">Main</div>
-
         <a href="bookings.php">Bookings</a>
         <a href="calendar.php">Calendar</a>
         <a href="dashboard.php">Dashboard</a>
@@ -116,7 +145,6 @@
     <!-- MANAGEMENT -->
     <div class="menu-group">
         <div class="menu-title">Management</div>
-
         <a href="landingpage.php">Landing Page</a>
         <a href="ratings.php">Ratings</a>
         <a href="therapists.php">Therapists</a>
@@ -128,8 +156,13 @@
     <!-- ACCOUNT -->
     <div class="menu-group">
         <div class="menu-title">Account</div>
-
         <a href="logout.php" class="logout-btn">Logout</a>
     </div>
 
 </div>
+
+<script>
+function toggleSidebar() {
+    document.getElementById('adminSidebar').classList.toggle('sidebar-open');
+}
+</script>

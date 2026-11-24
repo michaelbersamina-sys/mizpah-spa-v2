@@ -1,271 +1,596 @@
 <?php
-
 session_start();
+date_default_timezone_set('Asia/Manila');
 require_once __DIR__ . '/../includes/db.php';
 
-/* =========================
-   LOGIN CHECK
-========================= */
-
 if (!isset($_SESSION['user_id'])) {
-    header("Location: ../login.php");
+    header('Location: ../login.php');
     exit;
 }
 
 $user_id = (int)$_SESSION['user_id'];
-
-
-/* =========================
-   USER INFORMATION
-========================= */
-
-$user_query = mysqli_query($conn, "
-    SELECT name, email, profile_pic
-    FROM users
-    WHERE id='$user_id'
-    LIMIT 1
-");
-
-$user = mysqli_fetch_assoc($user_query);
-
-$user_name = $user['name'] ?? '';
-$user_email = $user['email'] ?? '';
-$profile_pic = $user['profile_pic'] ?? '';
-
-if (!empty($profile_pic)) {
-    $profile_image = "../uploads/profile/" . $profile_pic;
-} else {
-    $profile_image = "../assets/images/default-profile.png";
+$booking_error = '';
+$wellnessTerms = '';
+$termsResult = mysqli_query($conn, "SELECT wellness_terms FROM settings WHERE id = 1 LIMIT 1");
+if ($termsResult && ($termsRow = mysqli_fetch_assoc($termsResult))) {
+    $wellnessTerms = trim((string)($termsRow['wellness_terms'] ?? ''));
+}
+if ($wellnessTerms === '') {
+    $wellnessTerms = "1. Accuracy of Information\nI confirm that the wellness information I provide is accurate and complete to the best of my knowledge.\n\n2. Wellness Information\nI understand that the information will be used to help the spa understand my needs and relevant concerns before providing a service.\n\n3. Massage and Spa Services\nI understand that spa services are for relaxation and wellness and are not a substitute for professional medical care.\n\n4. Health and Safety\nI will disclose relevant allergies, medical conditions, injuries, pain, and skin sensitivities.\n\n5. Privacy\nMy information will be used for spa service and customer care and accessed only by authorized personnel.";
 }
 
+$userStmt = mysqli_prepare($conn, "SELECT name, email, profile_pic FROM users WHERE id = ? LIMIT 1");
+if ($userStmt) {
+    mysqli_stmt_bind_param($userStmt, 'i', $user_id);
+    mysqli_stmt_execute($userStmt);
+    $userResult = mysqli_stmt_get_result($userStmt);
+    $user = mysqli_fetch_assoc($userResult) ?: [];
+    mysqli_stmt_close($userStmt);
+} else {
+    $user = [];
+}
 
-/* =========================
-   GET LAST PHONE NUMBER
-========================= */
+$user_name = trim((string)($user['name'] ?? ''));
+$user_email = trim((string)($user['email'] ?? ''));
+$profile_pic = (string)($user['profile_pic'] ?? '');
+$profile_image = $profile_pic !== ''
+    ? '../uploads/profile/' . $profile_pic
+    : '../assets/images/default-profile.png';
 
 $last_phone = '';
+$phoneStmt = mysqli_prepare($conn, "SELECT phone FROM bookings WHERE user_id = ? AND phone IS NOT NULL AND phone <> '' ORDER BY id DESC LIMIT 1");
+if ($phoneStmt) {
+    mysqli_stmt_bind_param($phoneStmt, 'i', $user_id);
+    mysqli_stmt_execute($phoneStmt);
+    $phoneResult = mysqli_stmt_get_result($phoneStmt);
+    if ($phoneRow = mysqli_fetch_assoc($phoneResult)) {
+        $last_phone = trim((string)($phoneRow['phone'] ?? ''));
+    }
+    mysqli_stmt_close($phoneStmt);
+}
 
-$phone_query = mysqli_query($conn, "
-    SELECT phone
-    FROM bookings
-    WHERE user_id='$user_id'
-    AND phone IS NOT NULL
-    AND phone != ''
-    ORDER BY id DESC
-    LIMIT 1
-");
+$accountWellness = [];
+$wellnessStmt = mysqli_prepare($conn, "SELECT * FROM wellness_profiles WHERE user_id = ? LIMIT 1");
+if ($wellnessStmt) {
+    mysqli_stmt_bind_param($wellnessStmt, 'i', $user_id);
+    mysqli_stmt_execute($wellnessStmt);
+    $wellnessResult = mysqli_stmt_get_result($wellnessStmt);
+    $accountWellness = mysqli_fetch_assoc($wellnessResult) ?: [];
+    mysqli_stmt_close($wellnessStmt);
+}
 
-if ($phone_query && mysqli_num_rows($phone_query) > 0) {
-    $phone_row = mysqli_fetch_assoc($phone_query);
-    $last_phone = $phone_row['phone'] ?? '';
+$accountProfileReady = !empty($accountWellness)
+    && (int)($accountWellness['terms_accepted'] ?? 0) === 1
+    && trim((string)($accountWellness['allergies'] ?? '')) !== ''
+    && trim((string)($accountWellness['skin_sensitivity'] ?? '')) !== ''
+    && trim((string)($accountWellness['medical_conditions'] ?? '')) !== ''
+    && trim((string)($accountWellness['body_pain_injuries'] ?? '')) !== ''
+    && trim((string)($accountWellness['preferred_pressure'] ?? '')) !== '';
+
+function bookingDurationMinutes($duration) {
+    $duration = strtolower(trim((string)$duration));
+    $hours = 0.0; $minutes = 0;
+    if (preg_match('/(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|hr)\b/i', $duration, $m)) $hours = (float)$m[1];
+    if (preg_match('/(\d+)\s*(?:minutes?|mins?|min)\b/i', $duration, $m)) $minutes = (int)$m[1];
+    if ($hours > 0 || $minutes > 0) return (int)round($hours * 60) + $minutes;
+    if (is_numeric($duration)) { $n=(float)$duration; return $n > 3 ? (int)round($n) : (int)round($n*60); }
+    return 60;
+}
+function bookingOperatingMinutes($time, $openingHour) {
+    if (!preg_match('/^(\d{1,2}):(\d{2})(?::\d{2})?$/', trim((string)$time), $m)) return null;
+    $h=(int)$m[1]; $min=(int)$m[2];
+    if ($h<0 || $h>23 || $min<0 || $min>59) return null;
+    if ($h<$openingHour) $h+=24;
+    return $h*60+$min;
+}
+function bookingOpeningHour($date) {
+    $n=(int)date('N', strtotime($date));
+    return $n>=6 ? 13 : 15;
+}
+
+function bookingRoomHasCapacity($conn, $date, $time, $roomType, $guestDurations) {
+    $capacity = $roomType === 'Couple Room' ? 1 : 4;
+    $durations = array_values(array_filter(array_map('intval', $guestDurations), static fn($v) => $v > 0));
+    if (!$durations) return false;
+
+    // $date is already normalized to the actual calendar date by the booking flow.
+    $candidateStart = strtotime($date . ' ' . $time);
+    if ($candidateStart === false) return false;
+    $prepMinutes = 15;
+    $candidateMaxDuration = max($durations);
+    $queryEndDate = date('Y-m-d', $candidateStart + ($candidateMaxDuration + $prepMinutes) * 60);
+
+    $previousDate = date('Y-m-d', strtotime($date . ' -1 day'));
+    $sql = "SELECT b.id,b.booking_date,b.booking_time,b.duration AS parent_duration,
+                   COALESCE(NULLIF(b.pax,0),1) AS pax,b.created_by,
+                   bg.id AS guest_id,bg.duration AS guest_duration
+            FROM bookings b
+            LEFT JOIN booking_guests bg ON bg.booking_id=b.id
+            WHERE b.booking_date BETWEEN ? AND ? AND b.room_type=?
+              AND LOWER(TRIM(COALESCE(b.status,''))) NOT IN ('cancelled','completed')";
+    $stmt = mysqli_prepare($conn, $sql);
+    if (!$stmt) return false;
+    mysqli_stmt_bind_param($stmt, 'sss', $previousDate, $queryEndDate, $roomType);
+    if (!mysqli_stmt_execute($stmt)) { mysqli_stmt_close($stmt); return false; }
+    $result = mysqli_stmt_get_result($stmt);
+    $bookings = [];
+    while ($row = mysqli_fetch_assoc($result)) {
+        $id = (int)$row['id'];
+        if (!isset($bookings[$id])) {
+            $bookings[$id] = [
+                'start' => strtotime($row['booking_date'] . ' ' . $row['booking_time']),
+                'parent' => bookingDurationMinutes($row['parent_duration'] ?? '1 Hour'),
+                'pax' => max(1, (int)$row['pax']),
+                'created_by' => strtolower(trim((string)($row['created_by'] ?? ''))),
+                'durations' => []
+            ];
+        }
+        if (!empty($row['guest_id'])) {
+            $bookings[$id]['durations'][] = bookingDurationMinutes($row['guest_duration'] ?: $row['parent_duration']);
+        }
+    }
+    mysqli_stmt_close($stmt);
+
+    $events = [];
+    foreach ($bookings as $booking) {
+        if ($booking['start'] === false) continue;
+        $existingDurations = array_values(array_filter($booking['durations'], static fn($v) => $v > 0));
+        if (!$existingDurations) $existingDurations = array_fill(0, $booking['pax'], max(1, $booking['parent']));
+        // Admin Walk-ins have no automatic preparation buffer; online bookings do.
+        $existingPrep = $booking['created_by'] === 'admin' ? 0 : $prepMinutes;
+        if ($roomType === 'Couple Room') $existingDurations = [max($existingDurations)];
+        foreach ($existingDurations as $duration) {
+            $events[] = [$booking['start'], 1];
+            $events[] = [$booking['start'] + ((int)$duration + $existingPrep) * 60, -1];
+        }
+    }
+
+    if ($roomType === 'Couple Room') $durations = [max($durations)];
+    $candidateMaxEnd = $candidateStart;
+    foreach ($durations as $duration) {
+        $end = $candidateStart + ((int)$duration + $prepMinutes) * 60;
+        $events[] = [$candidateStart, 1];
+        $events[] = [$end, -1];
+        $candidateMaxEnd = max($candidateMaxEnd, $end);
+    }
+
+    usort($events, static function ($a, $b) { return $a[0] <=> $b[0] ?: $a[1] <=> $b[1]; });
+    $active = 0;
+    $index = 0;
+    $count = count($events);
+    while ($index < $count) {
+        $at = $events[$index][0];
+        $delta = 0;
+        while ($index < $count && $events[$index][0] === $at) {
+            $delta += $events[$index][1];
+            $index++;
+        }
+        $active += $delta;
+        // Only reject overload during the candidate's actual service/prep window.
+        if ($at >= $candidateStart && $at < $candidateMaxEnd && $active > $capacity) return false;
+    }
+    return true;
 }
 
 
-/* =========================
-   SUBMIT BOOKING
-========================= */
+function bookingTherapistsAreAvailable($conn, $date, $time, $assignedDuration) {
+    if (!$assignedDuration) return true;
+    $candidateStart = strtotime($date . ' ' . $time);
+    if ($candidateStart === false) return false;
+    $maxAssignedDuration = max(array_map('intval', $assignedDuration));
+    $queryEndDate = date('Y-m-d', $candidateStart + $maxAssignedDuration * 60);
+    $previousDate = date('Y-m-d', strtotime($date . ' -1 day'));
+    $sql = "SELECT b.booking_date,b.booking_time,b.duration AS parent_duration,b.therapist_id,
+                   bt.therapist_id AS assigned_therapist_id,bg.duration AS guest_duration
+            FROM bookings b
+            LEFT JOIN booking_therapists bt ON bt.booking_id=b.id
+            LEFT JOIN booking_guests bg ON bg.id=bt.booking_guest_id
+            WHERE b.booking_date BETWEEN ? AND ?
+              AND LOWER(TRIM(COALESCE(b.status,''))) NOT IN ('cancelled','completed')";
+    $stmt = mysqli_prepare($conn, $sql);
+    if (!$stmt) return false;
+    mysqli_stmt_bind_param($stmt, 'ss', $previousDate, $queryEndDate);
+    if (!mysqli_stmt_execute($stmt)) { mysqli_stmt_close($stmt); return false; }
+    $result = mysqli_stmt_get_result($stmt);
+    $available = true;
+    while ($row = mysqli_fetch_assoc($result)) {
+        $busyStart = strtotime($row['booking_date'] . ' ' . $row['booking_time']);
+        if ($busyStart === false) continue;
+        $assignedId = (int)($row['assigned_therapist_id'] ?? 0);
+        $therapistId = $assignedId > 0 ? $assignedId : (int)($row['therapist_id'] ?? 0);
+        if (!isset($assignedDuration[$therapistId])) continue;
+        $busyDuration = $assignedId > 0 && trim((string)($row['guest_duration'] ?? '')) !== ''
+            ? bookingDurationMinutes($row['guest_duration'])
+            : bookingDurationMinutes($row['parent_duration'] ?? '1 Hour');
+        $busyEnd = $busyStart + $busyDuration * 60;
+        $candidateEnd = $candidateStart + ((int)$assignedDuration[$therapistId]) * 60;
+        if ($candidateStart < $busyEnd && $busyStart < $candidateEnd) { $available = false; break; }
+    }
+    mysqli_stmt_close($stmt);
+    return $available;
+}
+
+
+/** Return one therapist who can cover this guest for the requested interval.
+ *  Excluded IDs are therapists already selected/reserved for another guest
+ *  in the same multi-guest booking.
+ */
+function bookingFindAvailableTherapist($conn, $date, $time, $durationMinutes, $excludedIds = []) {
+    $candidateStart = strtotime($date . ' ' . $time);
+    $durationMinutes = (int)$durationMinutes;
+    if ($candidateStart === false || $durationMinutes <= 0) return 0;
+    $candidateEnd = $candidateStart + $durationMinutes * 60;
+    $previousDate = date('Y-m-d', $candidateStart - 86400);
+    $endDate = date('Y-m-d', $candidateEnd);
+
+    $active = [];
+    $therapistResult = mysqli_query($conn, "SELECT id FROM therapists WHERE status='Active' ORDER BY id ASC");
+    if (!$therapistResult) return 0;
+    while ($therapist = mysqli_fetch_assoc($therapistResult)) {
+        $id = (int)$therapist['id'];
+        if ($id > 0 && !in_array($id, array_map('intval', $excludedIds), true)) $active[$id] = true;
+    }
+    if (!$active) return 0;
+
+    $sql = "SELECT b.booking_date,b.booking_time,b.duration AS parent_duration,b.therapist_id,
+                   bt.therapist_id AS assigned_therapist_id,bg.duration AS guest_duration
+            FROM bookings b
+            LEFT JOIN booking_therapists bt ON bt.booking_id=b.id
+            LEFT JOIN booking_guests bg ON bg.id=bt.booking_guest_id
+            WHERE b.booking_date BETWEEN ? AND ?
+              AND LOWER(TRIM(COALESCE(b.status,''))) NOT IN ('cancelled','completed')";
+    $stmt = mysqli_prepare($conn, $sql);
+    if (!$stmt) return 0;
+    mysqli_stmt_bind_param($stmt, 'ss', $previousDate, $endDate);
+    if (!mysqli_stmt_execute($stmt)) { mysqli_stmt_close($stmt); return 0; }
+    $result = mysqli_stmt_get_result($stmt);
+    while ($row = mysqli_fetch_assoc($result)) {
+        $busyStart = strtotime($row['booking_date'] . ' ' . $row['booking_time']);
+        if ($busyStart === false) continue;
+        $assignedId = (int)($row['assigned_therapist_id'] ?? 0);
+        $therapistId = $assignedId > 0 ? $assignedId : (int)($row['therapist_id'] ?? 0);
+        if (!isset($active[$therapistId])) continue;
+        $busyDuration = $assignedId > 0 && trim((string)($row['guest_duration'] ?? '')) !== ''
+            ? bookingDurationMinutes($row['guest_duration'])
+            : bookingDurationMinutes($row['parent_duration'] ?? '1 Hour');
+        $busyEnd = $busyStart + max(1, (int)$busyDuration) * 60;
+        if ($candidateStart < $busyEnd && $busyStart < $candidateEnd) unset($active[$therapistId]);
+    }
+    mysqli_stmt_close($stmt);
+    return $active ? (int)array_key_first($active) : 0;
+}
+
 
 if (isset($_POST['submit_booking'])) {
-
-    $name = $_POST['customer_name'] ?? '';
-    $phone = $_POST['phone'] ?? '';
-
-    $service_id = $_POST['service_id'] ?? '';
-    $service = $_POST['service'] ?? '';
-
-    $duration = $_POST['duration'] ?? '';
-
-    /*
-       IMPORTANT:
-       price now contains:
-       SERVICE/DURATION PRICE + ADD-ON PRICES
-    */
-    $price = $_POST['price'] ?? 0;
-
-    $date = $_POST['booking_date'] ?? '';
-    $time = $_POST['booking_time'] ?? '';
-
+    // Account details come from the signed-in account. Phone remains editable only
+    // when the customer has no previously saved booking phone number.
+    $name = $user_name;
+    $email = $user_email;
+    $phone = preg_replace('/\s+/', '', trim((string)($_POST['phone'] ?? $last_phone)));
+    $rawWellness = $_POST['wellness'] ?? [];
+    $date = trim((string)($_POST['booking_date'] ?? ''));
+    $time = trim((string)($_POST['booking_time'] ?? ''));
     $pax = (int)($_POST['pax'] ?? 1);
+    $payment = trim((string)($_POST['payment_method'] ?? 'Cash'));
+    $notes = '';
+    $room_type = trim((string)($_POST['room_type'] ?? ''));
+    $guestNames = array_merge([$name], array_values(array_map('trim', (array)($_POST['guest_names'] ?? []))));
+    $rawSelections = json_decode((string)($_POST['guest_selections'] ?? '[]'), true);
+    if ($room_type === 'Couple Room') $pax = 2;
 
-    $payment = $_POST['payment_method'] ?? 'Cash';
+    if (!$accountProfileReady) {
+        $booking_error = 'Please complete your Wellness Profile in My Account before booking.';
+    } elseif ($pax > 1 && ($_POST['wellness_terms_accepted'] ?? '') !== '1') {
+        $booking_error = 'Please read and accept the Wellness Profile Terms and Conditions for the additional guests.';
+    } elseif (!$name || !$phone || !$email || !filter_var($email, FILTER_VALIDATE_EMAIL) || count($guestNames) !== $pax || !is_array($rawSelections) || count($rawSelections) !== $pax || !is_array($rawWellness) || count($rawWellness) !== max(0, $pax - 1) || !$date || !$time || !$room_type) {
+        $booking_error = 'Please provide valid booking information and complete the Wellness Profile for every additional guest.';
+    } elseif (!preg_match('/^(?=.{2,100}$)[\p{L}][\p{L}\s.\'-]*$/u', $name)) {
+        $booking_error = 'Your account must have a valid full name before booking.';
+    } elseif (count(array_filter($guestNames, static fn($guestName) => preg_match('/^(?=.{2,100}$)[\p{L}][\p{L}\s.\'-]*$/u', trim($guestName)))) !== $pax) {
+        $booking_error = 'Please enter a valid full name for every additional guest.';
+    } elseif (!preg_match('/^09\d{9}$/', $phone)) {
+        $booking_error = 'Please enter a valid 11-digit Philippine mobile number starting with 09.';
+    } elseif (strlen($email) > 150) {
+        $booking_error = 'Your account email address is too long. Please update your account email.';
+    } elseif (!in_array($room_type, ['Single Room', 'Couple Room'], true) || $pax < 1 || $pax > 4 || ($room_type === 'Couple Room' && $pax !== 2)) {
+        $booking_error = 'Please select a valid room and guest count (Single Room: 1–4; Couple Room: exactly 2).';
+    } elseif (!in_array($payment, ['Cash', 'GCash'], true)) {
+        $booking_error = 'Please select a valid payment method.';
+    } elseif (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date) || !preg_match('/^\d{2}:\d{2}$/', $time) || !strtotime($date)) {
+        $booking_error = 'Please select a valid appointment date and time.';
+    } else {
+        $opening = bookingOpeningHour($date);
+        $now = new DateTime('now', new DateTimeZone('Asia/Manila'));
+        $selected = DateTime::createFromFormat('!Y-m-d H:i', $date . ' ' . $time, new DateTimeZone('Asia/Manila'));
+        // Times before the day's opening hour belong to the overnight portion
+        // of the selected operating day, so persist them on the next calendar day.
+        if ($selected && (int)substr($time, 0, 2) < $opening) $selected->modify('+1 day');
+        if ($selected) {
+            $date = $selected->format('Y-m-d');
+            $opening = bookingOpeningHour($date);
+        }
+        $start = bookingOperatingMinutes($time, $opening);
 
-    $notes = $_POST['notes'] ?? '';
+        $selections = [];
+        $totalPrice = 0.0;
+        $maxMinutes = 0;
+        $maxDuration = '';
+        $addonLabels = [];
+        $assigned = [];
+        $assignedDuration = [];
+        $wellnessProfiles = [];
 
-    $therapist = (int)($_POST['therapist'] ?? 0);
-    $selected_therapists = $_POST['therapists'] ?? [];
-    if (!is_array($selected_therapists)) { $selected_therapists = []; }
-    $selected_therapists = array_values(array_unique(array_filter(array_map('intval', $selected_therapists), static fn($id) => $id > 0)));
-    $pax = max(1, min(4, $pax));
+        // Guest 1 uses the saved account Wellness Profile; no duplicate form is shown.
+        $wellnessProfiles[1] = [
+            'allergies' => trim((string)$accountWellness['allergies']),
+            'skin_sensitivity' => trim((string)$accountWellness['skin_sensitivity']),
+            'medical_conditions' => trim((string)$accountWellness['medical_conditions']),
+            'body_pain_injuries' => trim((string)$accountWellness['body_pain_injuries']),
+            'pregnancy_status' => '',
+            'preferred_pressure' => trim((string)$accountWellness['preferred_pressure']),
+            'special_requests' => trim((string)($accountWellness['special_requests'] ?? '')),
+            'emergency_contact_name' => trim((string)($accountWellness['emergency_contact_name'] ?? '')),
+            'emergency_contact_number' => trim((string)($accountWellness['emergency_contact_number'] ?? ''))
+        ];
 
-    $addons = $_POST['addons'] ?? '';
-
-    $room_type = $_POST['room_type'] ?? '';
-    $additional_guest_names = array_values(array_filter(array_map('trim', (array)($_POST['guest_names'] ?? [])), static fn($v) => $v !== ''));
-    // The primary Full Name is Guest 1; only additional guests are entered below.
-    $guest_names = array_merge([trim((string)$name)], $additional_guest_names);
-    if ($room_type === 'Couple Room') { $pax = 2; }
-    if (count($selected_therapists) > $pax) { $selected_therapists = array_slice($selected_therapists, 0, $pax); }
-    if (!empty($selected_therapists)) { $therapist = $selected_therapists[0]; }
-
-    /* =========================
-       COUPLE ROOM = 2 PAX
-    ========================= */
-
-    if ($room_type === "Couple Room") {
-        $pax = 2;
-    }
-
-
-    /* =========================
-       ESCAPE VALUES
-    ========================= */
-
-    $name = mysqli_real_escape_string($conn, $name);
-
-    $phone = mysqli_real_escape_string($conn, $phone);
-
-    $service_id = (int)$service_id;
-
-    $service = mysqli_real_escape_string($conn, $service);
-
-    $duration = mysqli_real_escape_string($conn, $duration);
-
-    $price = (float)$price;
-    if (count($guest_names) !== $pax) { die('Please enter the name of every guest. Go back and complete the guest details.'); }
-    // The form already submits the total for all guests; do not multiply by pax again.
-
-    $date = mysqli_real_escape_string($conn, $date);
-
-    $time = mysqli_real_escape_string($conn, $time);
-
-    $payment = mysqli_real_escape_string($conn, $payment);
-
-    $notes = mysqli_real_escape_string($conn, $notes);
-
-    $therapist = (int)$therapist;
-
-    $addons = mysqli_real_escape_string($conn, $addons);
-
-    $room_type = mysqli_real_escape_string($conn, $room_type);
-
-
-    /* =========================
-       SERVER-SIDE DATE/TIME VALIDATION
-       ========================= */
-    $dateTimeZone = new DateTimeZone('Asia/Manila');
-    $nowManila = new DateTime('now', $dateTimeZone);
-    $selectedDateTime = DateTime::createFromFormat('!Y-m-d H:i', $date . ' ' . $time, $dateTimeZone);
-    $dayOfWeek = (int)date('w', strtotime($date));
-    $openingHour = ($dayOfWeek === 0 || $dayOfWeek === 6) ? 13 : 15;
-    if ($selectedDateTime && (int)substr($time, 0, 2) < $openingHour) {
-        $selectedDateTime->modify('+1 day');
-    }
-    if (!$selectedDateTime || $selectedDateTime < (clone $nowManila)->modify('+2 hours')) {
-        die('Please choose a booking time at least 2 hours from now.');
-    }
-
-    /* =========================
-       INSERT BOOKING
-    ========================= */
-
-    $sql = "
-        INSERT INTO bookings
-        (
-            user_id,
-            service,
-            duration,
-            price,
-            customer_name,
-            phone,
-            booking_date,
-            booking_time,
-            pax,
-            payment_method,
-            notes,
-            addons,
-            therapist_id,
-            room_type,
-            status
-        )
-        VALUES
-        (
-            '$user_id',
-            '$service',
-            '$duration',
-            '$price',
-            '$name',
-            '$phone',
-            '$date',
-            '$time',
-            '$pax',
-            '$payment',
-            '$notes',
-            '$addons',
-            '$therapist',
-            '$room_type',
-            'Pending'
-        )
-    ";
-
-
-    if (mysqli_query($conn, $sql)) {
-
-        $booking_id = mysqli_insert_id($conn);
-
-        // Match the current booking_guests table structure.
-        // duration, price, addons, and therapist_id are stored in bookings / booking_therapists.
-        $guestStmt = $conn->prepare("INSERT INTO booking_guests (booking_id, guest_number, guest_name, service_id, service, phone) VALUES (?, ?, ?, ?, ?, ?)");
-        if ($guestStmt) {
-            foreach ($guest_names as $idx => $guestName) {
-                $guestNumber = $idx + 1;
-                $guestStmt->bind_param('iisiss', $booking_id, $guestNumber, $guestName, $service_id, $service, $phone);
-                if (!$guestStmt->execute()) { die('Unable to save guest details: ' . $guestStmt->error); }
+        // Only additional guests (Guest 2 onward) complete a Wellness Profile here.
+        for ($guestNo = 2; $guestNo <= $pax; $guestNo++) {
+            $profile = $rawWellness[$guestNo] ?? null;
+            if (!is_array($profile)) {
+                $booking_error = 'Please complete the Wellness Profile for Guest ' . $guestNo . '.';
+                break;
             }
-            $guestStmt->close();
-        } else { die('Unable to prepare guest details: ' . $conn->error); }
-
-        /*
-           Keep booking_therapists synchronized
-           when customer selected a therapist.
-        */
-
-        if (!empty($selected_therapists)) {
-            $map = $conn->prepare("INSERT INTO booking_therapists (booking_id, therapist_id, assigned_by) VALUES (?, ?, 'customer')");
-            if ($map) {
-                foreach ($selected_therapists as $selected_id) {
-                    $map->bind_param('ii', $booking_id, $selected_id);
-                    $map->execute();
+            $profile = array_map(static fn($v) => trim((string)$v), $profile);
+            foreach (['allergies', 'skin_sensitivity', 'medical_conditions', 'body_pain_injuries', 'preferred_pressure'] as $requiredField) {
+                if (($profile[$requiredField] ?? '') === '') {
+                    $booking_error = 'Please complete all required Wellness Profile fields for Guest ' . $guestNo . '.';
+                    break 2;
                 }
-                $map->close();
             }
-        } elseif ($therapist > 0) {
-            $map = $conn->prepare("INSERT INTO booking_therapists (booking_id, therapist_id, assigned_by) VALUES (?, ?, 'customer')");
-            if ($map) {
-                $map->bind_param('ii', $booking_id, $therapist);
-                $map->execute();
-                $map->close();
+            $wellnessProfiles[$guestNo] = [
+                'allergies' => $profile['allergies'],
+                'skin_sensitivity' => $profile['skin_sensitivity'],
+                'medical_conditions' => $profile['medical_conditions'],
+                'body_pain_injuries' => $profile['body_pain_injuries'],
+                'pregnancy_status' => '',
+                'preferred_pressure' => $profile['preferred_pressure'],
+                'special_requests' => $profile['special_requests'] ?? '',
+                'emergency_contact_name' => $profile['emergency_contact_name'] ?? '',
+                'emergency_contact_number' => $profile['emergency_contact_number'] ?? ''
+            ];
+        }
+
+        if (!$booking_error && (!$selected || $selected < (clone $now)->modify('+2 hours'))) {
+            $booking_error = 'Please book at least 2 hours in advance.';
+        }
+
+        foreach ($rawSelections as $idx => $item) {
+            if ($booking_error) break;
+            $guestNo = $idx + 1;
+            $sid = (int)($item['service_id'] ?? 0);
+            $duration = trim((string)($item['duration'] ?? ''));
+            if ($sid <= 0 || $duration === '') {
+                $booking_error = 'Please select a service and duration for Guest ' . $guestNo . '.';
+                break;
+            }
+            $st = mysqli_prepare($conn, "SELECT s.service_name,s.category,sd.duration,sd.price FROM services s INNER JOIN service_durations sd ON sd.service_id=s.id WHERE s.id=? AND s.category IN ('Massage','Package','Promo') AND sd.duration=? LIMIT 1");
+            if (!$st) { $booking_error = 'Unable to validate the selected service. Please try again.'; break; }
+            mysqli_stmt_bind_param($st, 'is', $sid, $duration);
+            mysqli_stmt_execute($st);
+            $rs = mysqli_stmt_get_result($st);
+            $svc = mysqli_fetch_assoc($rs);
+            mysqli_stmt_close($st);
+            if (!$svc) {
+                $booking_error = 'The selected service or duration for Guest ' . $guestNo . ' is no longer available. Please select again.';
+                break;
+            }
+            $mins = bookingDurationMinutes($svc['duration']);
+            if ($mins <= 0) { $booking_error = 'Invalid service duration for Guest ' . $guestNo . '.'; break; }
+
+            $guestAddons = [];
+            $addonIds = array_values(array_unique(array_filter(array_map('intval', (array)($item['addons'] ?? [])), static fn($v) => $v > 0)));
+            $addonTotal = 0.0;
+            foreach ($addonIds as $aid) {
+                $as = mysqli_prepare($conn, "SELECT id,service_name,price FROM services WHERE id=? AND category='Add-ons' LIMIT 1");
+                if (!$as) { $booking_error = 'Unable to validate an add-on. Please try again.'; break; }
+                mysqli_stmt_bind_param($as, 'i', $aid);
+                mysqli_stmt_execute($as);
+                $ar = mysqli_stmt_get_result($as);
+                $ad = mysqli_fetch_assoc($ar);
+                mysqli_stmt_close($as);
+                if (!$ad) { $booking_error = 'An add-on selected for Guest ' . $guestNo . ' is no longer available.'; break; }
+                $ap = (float)$ad['price'];
+                $addonTotal += $ap;
+                $guestAddons[] = ['id' => (int)$ad['id'], 'name' => $ad['service_name'], 'price' => $ap];
+                $addonLabels[] = $ad['service_name'];
+            }
+            if ($booking_error) break;
+
+            $therapistId = (int)($item['therapist_id'] ?? 0);
+            if ($therapistId > 0) {
+                $ts = mysqli_prepare($conn, "SELECT id FROM therapists WHERE id=? AND status='Active' LIMIT 1");
+                if (!$ts) { $booking_error = 'Unable to validate the selected therapist.'; break; }
+                mysqli_stmt_bind_param($ts, 'i', $therapistId);
+                mysqli_stmt_execute($ts);
+                $tr = mysqli_stmt_get_result($ts);
+                $validTherapist = mysqli_fetch_assoc($tr);
+                mysqli_stmt_close($ts);
+                if (!$validTherapist) { $booking_error = 'The selected therapist for Guest ' . $guestNo . ' is no longer active. Please select again.'; break; }
+                if (in_array($therapistId, $assigned, true)) { $booking_error = 'Please choose a different therapist for each guest.'; break; }
+                $assigned[] = $therapistId;
+                $assignedDuration[$therapistId] = $mins;
+            }
+
+            $servicePrice = (float)$svc['price'];
+            $totalPrice += $servicePrice + $addonTotal;
+            $maxMinutes = max($maxMinutes, $mins);
+            if ($mins === $maxMinutes) $maxDuration = $svc['duration'];
+            $selections[] = [
+                'guest_number' => $guestNo,
+                'service_id' => $sid,
+                'service' => $svc['service_name'],
+                'duration' => $svc['duration'],
+                'price' => $servicePrice,
+                'addons' => $guestAddons,
+                'therapist_id' => $therapistId
+            ];
+        }
+
+        if (!$booking_error && ($start === null || $maxMinutes <= 0 || $start + $maxMinutes > 27 * 60)) {
+            $booking_error = 'The selected appointment must fit within the spa operating hours and finish by 3:00 AM.';
+        }
+
+        if (!$booking_error) {
+            $guestRoomDurations = array_map(static fn($g) => bookingDurationMinutes($g['duration']), $selections);
+            if (!bookingRoomHasCapacity($conn, $date, $time, $room_type, $guestRoomDurations)) {
+                $booking_error = $room_type === 'Couple Room'
+                    ? 'The Couple Room is already booked for this time. Please choose another time.'
+                    : 'Sorry, there are not enough Single Room slots available at this time. Please choose another time or reduce the guest count.';
             }
         }
 
-        header(
-            "Location: thankyou.php?id=" .
-            $booking_id
-        );
+        if (!$booking_error && !bookingTherapistsAreAvailable($conn, $date, $time, $assignedDuration)) {
+            $booking_error = 'One or more selected therapists are no longer available for the chosen schedule. Please select again.';
+        }
+        // No Preference is valid only when at least one distinct therapist can actually take each guest.
+        if (!$booking_error) {
+            $reservedTherapists = $assigned;
+            foreach ($selections as $guestSelection) {
+                if ((int)$guestSelection['therapist_id'] > 0) continue;
+                $availableTherapistId = bookingFindAvailableTherapist(
+                    $conn, $date, $time, bookingDurationMinutes($guestSelection['duration']), $reservedTherapists
+                );
+                if ($availableTherapistId <= 0) {
+                    $booking_error = 'No therapists are available for this schedule. Please choose another time slot.';
+                    break;
+                }
+                $reservedTherapists[] = $availableTherapistId;
+            }
+        }
 
-        exit;
+        if (!$booking_error) {
+            $serviceSummary = $pax === 1 ? 'Individual Booking' : ($room_type === 'Couple Room' ? 'Couple Booking' : 'Group Booking (' . $pax . ' guests)');
+            $durationSummary = $maxDuration;
+            $addonsSummary = implode(', ', array_values(array_unique($addonLabels)));
+            $primaryTherapist = $assigned[0] ?? 0;
 
-    } else {
+            mysqli_begin_transaction($conn);
+            $st = mysqli_prepare($conn, "INSERT INTO bookings (user_id,service,duration,price,customer_name,phone,email,booking_date,booking_time,pax,payment_method,notes,addons,therapist_id,room_type,status,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'Confirmed','customer')");
+            if (!$st) {
+                $ok = false;
+                $booking_error = 'Unable to prepare your booking. Please try again.';
+            } else {
+                mysqli_stmt_bind_param($st, 'issdsssssisssis', $user_id, $serviceSummary, $durationSummary, $totalPrice, $name, $phone, $email, $date, $time, $pax, $payment, $notes, $addonsSummary, $primaryTherapist, $room_type);
+                $ok = mysqli_stmt_execute($st);
+                $bookingId = $ok ? mysqli_insert_id($conn) : 0;
+                if (!$ok) $booking_error = 'Unable to save your booking. Please try again.';
+                mysqli_stmt_close($st);
+            }
 
-        die(
-            "Booking Error: " .
-            mysqli_error($conn)
-        );
+            if ($ok) {
+                $guestStmt = mysqli_prepare($conn, "INSERT INTO booking_guests (booking_id,guest_number,guest_name,service_id,service,duration,price,addons,therapist_id,phone) VALUES (?,?,?,?,?,?,?,?,?,?)");
+                if (!$guestStmt) {
+                    $ok = false;
+                    $booking_error = 'Unable to save guest details. Please contact the spa.';
+                }
+                foreach ($selections as $i => $g) {
+                    if (!$ok) break;
+                    $guestNo = $g['guest_number'];
+                    $gname = $guestNames[$i];
+                    $sid = $g['service_id'];
+                    $gservice = $g['service'];
+                    $gduration = $g['duration'];
+                    $gprice = $g['price'];
+                    $gaddonNames = implode(', ', array_column($g['addons'], 'name'));
+                    $gtid = $g['therapist_id'];
+                    mysqli_stmt_bind_param($guestStmt, 'iisissdsis', $bookingId, $guestNo, $gname, $sid, $gservice, $gduration, $gprice, $gaddonNames, $gtid, $phone);
+                    if (!mysqli_stmt_execute($guestStmt)) {
+                        $ok = false;
+                        $booking_error = 'Unable to save individual guest selections.';
+                        break;
+                    }
+                    $guestRowId = mysqli_insert_id($conn);
 
+                    foreach ($g['addons'] as $ad) {
+                        $as = mysqli_prepare($conn, "INSERT INTO booking_guest_addons (booking_guest_id,addon_service_id,addon_name,quantity,price) VALUES (?,?,?,1,?)");
+                        if (!$as) { $ok = false; break; }
+                        $aid = $ad['id']; $aname = $ad['name']; $aprice = $ad['price'];
+                        mysqli_stmt_bind_param($as, 'iisd', $guestRowId, $aid, $aname, $aprice);
+                        if (!mysqli_stmt_execute($as)) $ok = false;
+                        mysqli_stmt_close($as);
+                        if (!$ok) break;
+                    }
+
+                    if ($ok && $gtid > 0) {
+                        $bt = mysqli_prepare($conn, "INSERT INTO booking_therapists (booking_id,booking_guest_id,therapist_id,assigned_by,source,action_by) VALUES (?,?,?,'customer','customer','customer')");
+                        if (!$bt) { $ok = false; break; }
+                        mysqli_stmt_bind_param($bt, 'iii', $bookingId, $guestRowId, $gtid);
+                        if (!mysqli_stmt_execute($bt)) $ok = false;
+                        mysqli_stmt_close($bt);
+                    }
+                    if (!$ok) break;
+
+                    $wp = $wellnessProfiles[$guestNo];
+                    $termsAccepted = ($guestNo === 1)
+                        ? (int)($accountWellness['terms_accepted'] ?? 0)
+                        : 1;
+                    $termsAcceptedAt = date('Y-m-d H:i:s');
+                    $wellnessInsert = mysqli_prepare($conn, "INSERT INTO booking_guest_wellness (booking_guest_id,allergies,skin_sensitivity,medical_conditions,body_pain_injuries,pregnancy_status,preferred_pressure,special_requests,emergency_contact_name,emergency_contact_number,terms_accepted,terms_accepted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+                    if (!$wellnessInsert) { $ok = false; $booking_error = 'Unable to save the Wellness Profile for Guest ' . $guestNo . '.'; break; }
+                    mysqli_stmt_bind_param($wellnessInsert, 'isssssssssis', $guestRowId, $wp['allergies'], $wp['skin_sensitivity'], $wp['medical_conditions'], $wp['body_pain_injuries'], $wp['pregnancy_status'], $wp['preferred_pressure'], $wp['special_requests'], $wp['emergency_contact_name'], $wp['emergency_contact_number'], $termsAccepted, $termsAcceptedAt);
+                    if (!mysqli_stmt_execute($wellnessInsert)) {
+                        $ok = false;
+                        $booking_error = 'Unable to save the Wellness Profile for Guest ' . $guestNo . '.';
+                    }
+                    mysqli_stmt_close($wellnessInsert);
+                    if (!$ok) break;
+                }
+                if ($guestStmt) mysqli_stmt_close($guestStmt);
+            }
+
+            if ($ok) {
+                mysqli_commit($conn);
+                try {
+                    require_once __DIR__ . '/../includes/mailer.php';
+                    $mailGuests = [];
+                    foreach ($selections as $i => $g) {
+                        $mailGuests[] = [
+                            'guest_number' => $g['guest_number'],
+                            'name' => $guestNames[$i],
+                            'service' => $g['service'],
+                            'duration' => $g['duration'],
+                            'price' => $g['price'],
+                            'addons' => $g['addons']
+                        ];
+                    }
+                    $mailData = [
+                        'id' => $bookingId,
+                        'customer_name' => $name,
+                        'phone' => $phone,
+                        'email' => $email,
+                        'booking_date' => $date,
+                        'booking_time' => $time,
+                        'pax' => $pax,
+                        'payment_method' => $payment,
+                        'price' => $totalPrice,
+                        'guests' => $mailGuests,
+                        'notes' => $notes
+                    ];
+                    if (function_exists('mizpahSendBookingEmails')) mizpahSendBookingEmails($mailData);
+                    else error_log('Mizpah mailer is missing mizpahSendBookingEmails().');
+                } catch (Throwable $mailError) {
+                    error_log('Mizpah customer booking email error: ' . $mailError->getMessage());
+                }
+                header('Location: thankyou.php?id=' . $bookingId);
+                exit;
+            }
+
+            mysqli_rollback($conn);
+            if (!$booking_error) $booking_error = 'Unable to save the booking. Please try again.';
+        }
     }
 }
-
 ?>
-
 <!DOCTYPE html>
 
 <html lang="en">
@@ -279,7 +604,7 @@ if (isset($_POST['submit_booking'])) {
     content="width=device-width, initial-scale=1"
 >
 
-<title>Book an Appointment</title>
+<title>Book an Appointment | Mizpah Wellness Spa</title>
 
 <link
     href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600&family=Poppins:wght@300;400;500;600;700&display=swap"
@@ -301,124 +626,127 @@ html{
 
 body{
 
+    min-height:100vh;
+
     background:
         linear-gradient(
-            rgba(0,0,0,.82),
-            rgba(0,0,0,.92)
+            rgba(0,0,0,.84),
+            rgba(0,0,0,.94)
         ),
         url('../assets/images/hero.jpg')
         center/cover fixed no-repeat;
 
     color:#fff;
 
-    min-height:100vh;
-
 }
 
 
-/* =========================
+/* =========================================================
    HEADER
-========================= */
+   ========================================================= */
 
-header{
+.site-header{
+
+    min-height:70px;
 
     display:flex;
-
-    justify-content:space-between;
     align-items:center;
+    justify-content:space-between;
 
-    padding:14px 8%;
+    padding:12px 7%;
 
-    background:
-        rgba(10,10,10,.95);
+    background:rgba(10,10,10,.96);
 
     border-bottom:
         1px solid
-        rgba(214,194,156,.15);
+        rgba(214,194,156,.16);
 
     position:sticky;
-
     top:0;
 
     z-index:1000;
 
 }
 
-.logo{
+.brand{
 
     display:flex;
-
     align-items:center;
 
-    gap:10px;
+    gap:11px;
+
+    text-decoration:none;
+
+}
+
+.brand img{
+
+    width:42px;
+    height:42px;
+
+    object-fit:contain;
+
+}
+
+.brand span{
+
+    font-family:
+        'Playfair Display',
+        serif;
 
     color:#D6C29C;
+
+    font-size:18px;
 
     font-weight:600;
 
 }
 
-.logo img{
-
-    height:40px;
-
-}
-
-nav{
+.header-links{
 
     display:flex;
-
     align-items:center;
 
     gap:8px;
 
 }
 
-nav a{
+.header-links a{
 
-    color:#fff;
-
-    padding:8px 11px;
+    color:#ddd;
 
     text-decoration:none;
 
-    font-size:13px;
+    font-size:12px;
 
-    opacity:.8;
+    padding:8px 11px;
+
+    border-radius:7px;
 
     transition:.2s;
 
 }
 
-nav a:hover{
+.header-links a:hover{
 
     color:#D6C29C;
 
-    opacity:1;
-
 }
 
-.profile-mini{
-
-    width:36px;
-    height:36px;
-
-    object-fit:cover;
-
-    border-radius:50%;
+.login-btn{
 
     border:
-        2px solid
-        #D6C29C;
+        1px solid
+        rgba(214,194,156,.4);
 
-    margin-left:8px;
+    color:#D6C29C !important;
 
 }
 
 
-/* =========================
+/* =========================================================
    PAGE
-========================= */
+   ========================================================= */
 
 .page{
 
@@ -435,13 +763,27 @@ nav a:hover{
 }
 
 
-/* =========================
-   TITLE
-========================= */
+/* =========================================================
+   PAGE HEADING
+   ========================================================= */
 
 .page-heading{
 
     margin-bottom:28px;
+
+}
+
+.eyebrow{
+
+    color:#8c7d63;
+
+    text-transform:uppercase;
+
+    letter-spacing:2px;
+
+    font-size:9px;
+
+    margin-bottom:5px;
 
 }
 
@@ -453,7 +795,7 @@ nav a:hover{
 
     color:#D6C29C;
 
-    font-size:32px;
+    font-size:34px;
 
     margin-bottom:7px;
 
@@ -463,37 +805,68 @@ nav a:hover{
 
     color:#888;
 
-    font-size:12px;
+    font-size:11px;
 
-    line-height:1.7;
+    line-height:1.8;
 
-    max-width:650px;
+    max-width:680px;
 
 }
 
 
-/* =========================
-   LAYOUT
-========================= */
+/* =========================================================
+   ERROR
+   ========================================================= */
+
+.error-box{
+
+    background:
+        rgba(150,60,60,.12);
+
+    border:
+        1px solid
+        rgba(200,100,100,.25);
+
+    color:#dca2a2;
+
+    padding:12px 15px;
+
+    border-radius:10px;
+
+    margin-bottom:18px;
+
+    font-size:11px;
+
+}
+
+
+/* =========================================================
+   MAIN LAYOUT
+   ========================================================= */
 
 .booking-layout{
 
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 330px;
-    gap: 22px;
-    align-items: start;
+    display:grid;
+
+    grid-template-columns:
+        minmax(0,1fr)
+        330px;
+
+    gap:22px;
+
+    align-items:start;
 
 }
 
 
-/* =========================
-   SECTION
-========================= */
+/* =========================================================
+   SECTIONS
+   ========================================================= */
 
 .section{
 
     background:
-        rgba(18,18,18,.91);
+        rgba(18,18,18,.93);
 
     border:
         1px solid
@@ -519,7 +892,7 @@ nav a:hover{
 
     gap:12px;
 
-    margin-bottom:18px;
+    margin-bottom:19px;
 
 }
 
@@ -530,12 +903,12 @@ nav a:hover{
 
     min-width:29px;
 
+    border-radius:50%;
+
     display:flex;
 
     justify-content:center;
     align-items:center;
-
-    border-radius:50%;
 
     background:
         rgba(214,194,156,.10);
@@ -570,14 +943,9 @@ nav a:hover{
 
     font-size:10px;
 
-    line-height:1.5;
+    line-height:1.6;
 
 }
-
-
-/* =========================
-   SUB LABEL
-========================= */
 
 .field-title{
 
@@ -598,15 +966,13 @@ nav a:hover{
 }
 
 .field-title:first-child{
-
     margin-top:0;
-
 }
 
 
-/* =========================
-   GRID
-========================= */
+/* =========================================================
+   SELECTION CARDS
+   ========================================================= */
 
 .selection-grid{
 
@@ -622,14 +988,22 @@ nav a:hover{
 
 }
 
-
-/* =========================
-   SELECTABLE CARD
-========================= */
-
 .select-card{
 
+    min-height:49px;
+
     position:relative;
+
+    display:flex;
+
+    flex-direction:column;
+
+    justify-content:center;
+    align-items:center;
+
+    text-align:center;
+
+    padding:12px 10px;
 
     background:#101010;
 
@@ -639,46 +1013,31 @@ nav a:hover{
 
     border-radius:10px;
 
-    padding:13px 10px;
-
-    text-align:center;
+    color:#ccc;
 
     cursor:pointer;
 
     font-size:11px;
 
-    color:#ccc;
-
     transition:.2s;
-
-    min-height:48px;
-
-    display:flex;
-
-    flex-direction:column;
-
-    justify-content:center;
-    align-items:center;
 
 }
 
 .select-card:hover{
+
+    transform:
+        translateY(-1px);
 
     border-color:
         rgba(214,194,156,.55);
 
     color:#fff;
 
-    transform:
-        translateY(-1px);
-
 }
 
 .select-card.active{
 
-    border:
-        1px solid
-        #D6C29C;
+    border-color:#D6C29C;
 
     background:
         rgba(214,194,156,.08);
@@ -687,23 +1046,13 @@ nav a:hover{
 
     box-shadow:
         0 0 0 1px
-        rgba(214,194,156,.05);
+        rgba(214,194,156,.04);
 
 }
 
 .select-card.unavailable{
 
     opacity:.30;
-
-    cursor:not-allowed;
-
-    border-color:#382626;
-
-}
-
-.select-card.dim{
-
-    opacity:.28;
 
     cursor:not-allowed;
 
@@ -727,28 +1076,11 @@ nav a:hover{
 
     font-size:9px;
 
-    margin-top:4px;
-
     line-height:1.4;
 
-}
-
-.available-text{
-
-    color:#9ab99a;
+    margin-top:4px;
 
 }
-
-.unavailable-text{
-
-    color:#bd8585;
-
-}
-
-
-/* =========================
-   SERVICE DESCRIPTION
-========================= */
 
 .service-description{
 
@@ -774,9 +1106,9 @@ nav a:hover{
 }
 
 
-/* =========================
-   INPUTS
-========================= */
+/* =========================================================
+   FORM
+   ========================================================= */
 
 .form-grid{
 
@@ -791,11 +1123,11 @@ nav a:hover{
 
 .form-group{
 
-    margin-bottom:2px;
+    min-width:0;
 
 }
 
-.full{
+.form-group.full{
 
     grid-column:
         1 / -1;
@@ -887,26 +1219,10 @@ input:read-only{
 
 }
 
-/* Keep the native calendar icon compact without enlarging the date field. */
-input[type="date"] {
-    color-scheme: dark;
-    cursor: pointer;
-}
 
-input[type="date"]::-webkit-calendar-picker-indicator {
-    width: 13px;
-    height: 13px;
-    padding: 0;
-    margin: 0 1px 0 4px;
-    opacity: .9;
-    cursor: pointer;
-    filter: brightness(0) invert(1);
-}
-
-
-/* =========================
-   SCHEDULE GRID
-========================= */
+/* =========================================================
+   SCHEDULE
+   ========================================================= */
 
 .schedule-grid{
 
@@ -917,18 +1233,9 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 
     gap:16px;
 
-}
-
-.schedule-block{
-
-    min-width:0;
+    margin-top:18px;
 
 }
-
-
-/* =========================
-   TIME
-========================= */
 
 .time-grid{
 
@@ -1003,9 +1310,53 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 }
 
 
-/* =========================
-   MESSAGE
-========================= */
+/* =========================================================
+   THERAPIST
+   ========================================================= */
+
+.therapist-choice{
+
+    display:grid;
+
+    grid-template-columns:
+        repeat(2,1fr);
+
+    gap:9px;
+
+    margin-bottom:13px;
+
+}
+
+.therapist-list{
+
+    display:grid;
+
+    grid-template-columns:
+        repeat(3,1fr);
+
+    gap:9px;
+
+    margin-top:10px;
+
+}
+
+.therapist-card{
+
+    min-height:65px;
+
+}
+
+.available-text{
+
+    color:#8fa98f;
+
+}
+
+.unavailable-text{
+
+    color:#b78383;
+
+}
 
 .message{
 
@@ -1020,28 +1371,32 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 }
 
 
-/* =========================
+/* =========================================================
    SUMMARY
-========================= */
+   ========================================================= */
 
+.summary-panel{
 
-.summary-sticky {
-    position: sticky;
-    top: 86px;
-    align-self: start;
+    position:sticky;
+
+    top:88px;
+
+    background:
+        rgba(18,18,18,.97);
+
+    border:
+        1px solid
+        rgba(214,194,156,.17);
+
+    border-radius:16px;
+
+    padding:22px;
+
+    box-shadow:
+        0 16px 40px
+        rgba(0,0,0,.30);
+
 }
-
-.summary-panel {
-    position: static;
-
-    background: rgba(18,18,18,.96);
-    border: 1px solid rgba(214,194,156,.17);
-    border-radius: 16px;
-    padding: 22px;
-
-    box-shadow: 0 16px 40px rgba(0,0,0,.30);
-}
-
 
 .summary-panel h3{
 
@@ -1063,7 +1418,7 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 
     font-size:9px;
 
-    margin-bottom:19px;
+    margin-bottom:18px;
 
 }
 
@@ -1099,24 +1454,21 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 
     text-align:right;
 
-    max-width:175px;
+    max-width:180px;
 
 }
 
 .summary-addons{
 
-    color:#aaa;
-
-    font-size:9px;
-
-    line-height:1.6;
+    line-height:1.5;
 
 }
 
 .price-area{
 
     padding:
-        15px 0 5px;
+        15px 0
+        4px;
 
 }
 
@@ -1172,18 +1524,13 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 
 }
 
-
-/* =========================
-   BOOK BUTTON
-========================= */
-
 .book-btn{
 
     width:100%;
 
-    padding:13px;
-
     margin-top:17px;
+
+    padding:13px;
 
     border:none;
 
@@ -1216,217 +1563,331 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 
 .booking-note{
 
-    margin-top:10px;
-
     color:#555;
 
     font-size:8px;
 
-    text-align:center;
-
     line-height:1.5;
 
-}
+    text-align:center;
 
-
-/* =========================
-   RESPONSIVE
-========================= */
-
-@media(max-width:1000px){
-
-    .booking-layout{
-
-        grid-template-columns:1fr;
-
-    }
-
-    .summary-sticky{
-
-        position:static;
-
-    }
+    margin-top:10px;
 
 }
 
+
+/* =========================================================
+   RESPONSIVE + STICKY BOOKING SUMMARY
+   ========================================================= */
+
+/* =========================================================
+   STICKY BOOKING SUMMARY
+   Apply sticky positioning to the GRID ITEM wrapper, not the
+   inner .summary-panel. This lets the whole summary follow the
+   long booking form while the PAGE remains the only scroll area.
+   ========================================================= */
+.booking-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 330px;
+    gap: 22px;
+    align-items: start;
+}
+
+/* The summary is wrapped in the second direct child of the grid. */
+.booking-layout > div:last-child {
+    position: -webkit-sticky;
+    position: sticky;
+    top: 88px;
+    align-self: start;
+    height: auto;
+    max-height: none;
+    overflow: visible;
+}
+
+/* Keep the panel itself in normal flow inside its sticky wrapper. */
+.summary-panel {
+    position: static;
+    top: auto;
+    height: auto;
+    max-height: none;
+    overflow: visible;
+}
+
+/* Tablet/mobile: stack the summary under the form. */
+@media (max-width: 900px) {
+    .booking-layout {
+        grid-template-columns: minmax(0, 1fr);
+        align-items: start;
+    }
+
+    .booking-layout > div:last-child {
+        position: static;
+        top: auto;
+        max-height: none;
+        overflow: visible;
+    }
+
+    .summary-panel {
+        position: static;
+        top: auto;
+        max-height: none;
+        overflow: visible;
+    }
+}
+
+@media (max-width: 750px) {
+    .site-header {
+        padding: 12px 4%;
+    }
+
+    .brand span {
+        display: none;
+    }
+
+    .header-links {
+        gap: 2px;
+    }
+
+    .header-links a {
+        padding: 7px;
+        font-size: 10px;
+    }
+
+    .page {
+        padding: 28px 4% 50px;
+    }
+
+    .schedule-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .time-grid {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .therapist-list {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 550px) {
+    .page-heading h1 {
+        font-size: 27px;
+    }
+
+    .section {
+        padding: 17px;
+    }
+
+    .form-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .form-group.full {
+        grid-column: auto;
+    }
+
+    .selection-grid,
+    .therapist-choice {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .time-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .summary-panel {
+        padding: 17px;
+    }
+
+    .summary-value {
+        overflow-wrap: anywhere;
+    }
+}
+
+
+/* Compact calendar picker icon; keep the date field dimensions unchanged. */
+input[type="date"] {
+    color-scheme: dark;
+    cursor: pointer;
+}
+input[type="date"]::-webkit-calendar-picker-indicator {
+    width: 13px !important;
+    height: 13px !important;
+    max-width: 13px;
+    max-height: 13px;
+    padding: 0 !important;
+    margin: 0 2px 0 5px !important;
+    opacity: 1;
+    cursor: pointer;
+    filter: brightness(0) invert(1);
+    background-size: 13px 13px;
+}
+
+/* MODERN MIZPAH TRANSACTION DIALOG */
+.mizpah-dialog-backdrop{position:fixed;inset:0;z-index:99999;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(0,0,0,.78);backdrop-filter:blur(5px)}
+.mizpah-dialog-backdrop.is-visible{display:flex}
+.mizpah-dialog{width:100%;max-width:390px;padding:28px 26px 24px;text-align:center;background:linear-gradient(145deg,#1b1a17,#10100f);border:1px solid rgba(214,194,156,.35);border-radius:17px;box-shadow:0 22px 70px rgba(0,0,0,.65);animation:mizpahDialogIn .18s ease-out}
+.mizpah-dialog-icon{width:48px;height:48px;margin:0 auto 15px;display:flex;align-items:center;justify-content:center;border:1px solid rgba(214,194,156,.5);border-radius:50%;color:#D6C29C;background:rgba(214,194,156,.09);font-family:Georgia,serif;font-size:25px}
+.mizpah-dialog h2{margin:0 0 9px;color:#D6C29C;font-family:'Playfair Display',serif;font-size:21px;font-weight:600}
+.mizpah-dialog p{margin:0;color:#c4c0b8;font-size:12px;line-height:1.75;overflow-wrap:anywhere}
+.mizpah-dialog-button{min-width:112px;margin-top:22px;padding:10px 24px;border:1px solid #D6C29C;border-radius:8px;background:#D6C29C;color:#171512;font-family:Poppins,sans-serif;font-size:11px;font-weight:600;cursor:pointer;transition:.2s ease}
+.mizpah-dialog-button:hover{background:#e5d4b2;transform:translateY(-1px)}
+.mizpah-dialog-button:focus-visible{outline:2px solid #fff;outline-offset:3px}
+@keyframes mizpahDialogIn{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
+@media(max-width:480px){.mizpah-dialog{padding:25px 20px 21px}.mizpah-dialog h2{font-size:19px}}
+
+
+.legacy-shared-service,.legacy-shared-therapists{display:none!important}
+.guest-choice-card{border:1px solid rgba(214,194,156,.22);background:rgba(18,16,13,.72);border-radius:12px;padding:16px;margin:14px 0}
+.guest-choice-card h3{font-family:'Playfair Display',serif;color:#D6C29C;font-size:17px;margin-bottom:12px}
+.guest-choice-card .field-title{margin-top:12px}
+.guest-choice-card select{width:100%;background:#171411;color:#fff;border:1px solid rgba(214,194,156,.35);border-radius:8px;padding:11px;font-family:inherit;font-size:11px;line-height:1.4}
+.guest-choice-card .selection-grid{margin-bottom:8px}
+.guest-choice-card .guest-addons{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:9px}
+.guest-choice-card .guest-therapist-select{margin-top:10px}
+.guest-choice-card .guest-line-total{color:#D6C29C;font-weight:600;margin-top:12px}
+.guest-choice-card .select-card{min-height:42px}
+
+
+
+/* Schedule fields share one row while space allows. */
+.schedule-date-guests{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:14px;
+    margin-top:18px;
+}
+
+/* Therapist choices: guest panels side-by-side, names in tidy compact grids. */
+#individualGuestTherapists{
+    display:grid;
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:12px;
+    align-items:start;
+}
+#individualGuestTherapists .guest-choice-card{
+    min-width:0;
+    margin:0;
+    padding:13px;
+}
+#individualGuestTherapists .guest-choice-card h3{
+    font-size:14px;
+    margin-bottom:9px;
+}
+#individualGuestTherapists .guest-therapist-select{
+    display:flex;
+    flex-direction:column;
+    gap:8px;
+}
+#individualGuestTherapists .guest-no-preference{
+    display:inline-flex;
+    align-self:flex-start;
+    flex-direction:row;
+    gap:5px;
+    align-items:center;
+    justify-content:center;
+    width:auto;
+    min-height:31px;
+    padding:6px 11px;
+    border-radius:18px;
+    font-size:9px;
+}
+#individualGuestTherapists .guest-no-preference .card-desc{
+    margin:0;
+    font-size:8px;
+}
+.guest-therapist-list{
+    display:grid;
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:7px;
+    margin-top:2px;
+}
+.guest-therapist-list .select-card{
+    display:flex;
+    width:100%;
+    min-width:0;
+    min-height:35px;
+    padding:7px 8px;
+    margin:0;
+    border-radius:8px;
+    font-size:9px;
+    line-height:1.25;
+    white-space:normal;
+    overflow-wrap:anywhere;
+}
+.guest-therapist-list .select-card.active{border-color:#D6C29C;}
+.guest-therapist-list .select-card.unavailable{opacity:.38;}
+.guest-no-preference.unavailable{opacity:.38;cursor:not-allowed;pointer-events:none;border-color:#6b6253!important;}
 @media(max-width:750px){
-
-    header{
-
-        padding:12px 4%;
-
-    }
-
-    .logo span{
-
-        display:none;
-
-    }
-
-    nav{
-
-        gap:1px;
-
-    }
-
-    nav a{
-
-        padding:6px;
-
-        font-size:10px;
-
-    }
-
-    .profile-mini{
-
-        width:32px;
-        height:32px;
-
-        margin-left:4px;
-
-    }
-
-    .page{
-
-        padding:
-            28px 4%
-            50px;
-
-    }
-
-    .schedule-grid{
-
-        grid-template-columns:1fr;
-
-    }
-
-    .time-grid{
-
-        grid-template-columns:
-            repeat(3,1fr);
-
-    }
-
+    .schedule-date-guests{grid-template-columns:repeat(2,minmax(0,1fr));}
+    #individualGuestTherapists{grid-template-columns:repeat(2,minmax(0,1fr));}
 }
-
 @media(max-width:550px){
-
-    .page-heading h1{
-
-        font-size:27px;
-
-    }
-
-    .section{
-
-        padding:17px;
-
-    }
-
-    .form-grid{
-
-        grid-template-columns:1fr;
-
-    }
-
-    .full{
-
-        grid-column:auto;
-
-    }
-
-    .selection-grid{
-
-        grid-template-columns:
-            repeat(2,1fr);
-
-    }
-
-    .time-grid{
-
-        grid-template-columns:
-            repeat(2,1fr);
-
-    }
-
+    .schedule-date-guests{grid-template-columns:minmax(0,1fr);}
+    #individualGuestTherapists{grid-template-columns:minmax(0,1fr);}
+    .guest-therapist-list{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;}
+    .guest-therapist-list .select-card{min-height:32px;padding:7px;font-size:9px;}
 }
 
 </style>
 
 </head>
 
+
 <body>
 
 
-<!-- =========================
+<!-- =========================================================
      HEADER
-========================= -->
+     ========================================================= -->
 
-<header>
-
-    <div class="logo">
-
-        <img
-            src="../assets/images/logo.png"
-            alt="Mizpah Logo"
-        >
-
-        <span>
-            Mizpah Wellness Spa
-        </span>
-
+<header class="site-header">
+    <a href="dashboard.php" class="brand">
+        <img src="../assets/images/logo.png" alt="Mizpah Logo">
+        <span>Mizpah Wellness Spa</span>
+    </a>
+    <div class="header-links">
+        <a href="dashboard.php">Home</a>
+        <a href="mybookings.php">My Bookings</a>
+        <a href="profile.php">Profile</a>
+        <a href="logout.php" class="login-btn">Logout</a>
+        <img src="<?= htmlspecialchars($profile_image, ENT_QUOTES, 'UTF-8') ?>" alt="Profile" style="width:34px;height:34px;border-radius:50%;object-fit:cover;border:1px solid #D6C29C;">
     </div>
-
-
-    <nav>
-
-        <a href="dashboard.php">
-            Home
-        </a>
-
-        <a href="mybookings.php">
-            My Bookings
-        </a>
-
-        <a href="profile.php">
-            Profile
-        </a>
-
-        <a href="logout.php">
-            Logout
-        </a>
-
-        <img
-            src="<?= htmlspecialchars($profile_image) ?>"
-            class="profile-mini"
-            alt="Profile"
-        >
-
-    </nav>
-
 </header>
 
 
-<!-- =========================
+<!-- =========================================================
      PAGE
-========================= -->
+     ========================================================= -->
 
 <div class="page">
 
 
     <div class="page-heading">
 
+        <div class="eyebrow">
+            Customer Booking
+        </div>
+
         <h1>
             Book an Appointment
         </h1>
 
         <p>
-            Choose your preferred service, schedule,
-            room and therapist. Review your booking
-            details before confirming your appointment.
+            Your account details are ready. Choose your room and schedule,
+            select services for each guest, then choose therapists and review your booking.
         </p>
 
     </div>
+
+
+    <?php if (!empty($booking_error)): ?>
+
+        <div class="error-box">
+            <?= htmlspecialchars($booking_error) ?>
+        </div>
+
+    <?php endif; ?>
 
 
     <form
@@ -1434,710 +1895,696 @@ input[type="date"]::-webkit-calendar-picker-indicator {
         id="bookingForm"
     >
 
-
-    <div class="booking-layout">
-
-
-        <!-- =========================
-             LEFT SIDE
-        ========================= -->
-
-        <div>
+        <input type="hidden" name="guest_selections" id="guest_selections" value="[]">
 
 
-            <!-- =====================
-                 STEP 1
-            ====================== -->
+        <div class="booking-layout">
 
-            <div class="section">
 
-                <div class="section-head">
+            <!-- =================================================
+                 LEFT COLUMN
+                 ================================================= -->
 
-                    <div class="step">
-                        1
-                    </div>
+            <div>
 
-                    <div>
 
-                        <div class="section-title">
-                            Choose Your Service
+                <!-- =============================================
+                     STEP 2
+                     ============================================= -->
+
+                <div class="section">
+
+                    <div class="section-head">
+
+                        <div class="step">
+                            1
                         </div>
 
-                        <div class="section-sub">
-                            Select a category, service,
-                            duration and optional add-ons.
-                        </div>
+                        <div>
 
-                    </div>
+                            <div class="section-title">
+                                Schedule & Room
+                            </div>
 
-                </div>
+                            <div class="section-sub">
+                                Choose your room and appointment date.
+                                Select your time after choosing services.
+                            </div>
 
-
-                <!-- CATEGORY -->
-
-                <div class="field-title">
-                    Category
-                </div>
-
-                <div class="selection-grid">
-
-                    <div
-                        class="select-card category"
-                        data-cat="Massage"
-                    >
-                        Massage
-                    </div>
-
-                    <div
-                        class="select-card category"
-                        data-cat="Package"
-                    >
-                        Package
-                    </div>
-
-                    <div
-                        class="select-card category"
-                        data-cat="Promo"
-                    >
-                        Promo
-                    </div>
-
-                </div>
-
-
-                <!-- SERVICE -->
-
-                <div class="field-title">
-                    Service
-                </div>
-
-                <div
-                    class="selection-grid"
-                    id="serviceBox"
-                >
-
-                    <div
-                        class="message"
-                        style="grid-column:1/-1;"
-                    >
-                        Select a category first.
-                    </div>
-
-                </div>
-
-
-                <div
-                    id="serviceDesc"
-                    class="service-description"
-                >
-                    Select a service to view
-                    its description.
-                </div>
-
-
-                <!-- DURATION -->
-
-                <div class="field-title">
-                    Duration
-                </div>
-
-                <div
-                    class="selection-grid"
-                    id="durationBox"
-                >
-
-                    <div
-                        class="message"
-                        style="grid-column:1/-1;"
-                    >
-                        Select a service first.
-                    </div>
-
-                </div>
-
-
-                <!-- ADDONS -->
-
-                <div class="field-title">
-                    Add-ons
-                    <span style="
-                        color:#555;
-                        text-transform:none;
-                    ">
-                        (Optional)
-                    </span>
-                </div>
-
-                <div
-                    class="selection-grid"
-                    id="addonBox"
-                >
-
-                    <div
-                        class="message"
-                        style="grid-column:1/-1;"
-                    >
-                        Add-ons will appear
-                        after selecting a service.
-                    </div>
-
-                </div>
-
-                <input
-                    type="hidden"
-                    name="addons"
-                    id="addons"
-                >
-
-            </div>
-
-
-            <!-- =====================
-                 STEP 2
-            ====================== -->
-
-            <div class="section">
-
-                <div class="section-head">
-
-                    <div class="step">
-                        2
-                    </div>
-
-                    <div>
-
-                        <div class="section-title">
-                            Schedule & Room
-                        </div>
-
-                        <div class="section-sub">
-                            Choose your preferred room,
-                            appointment date and available
-                            time.
                         </div>
 
                     </div>
 
-                </div>
 
+                    <!-- ROOM -->
 
-                <!-- ROOM -->
-
-                <div class="field-title">
-                    Room Type
-                </div>
-
-                <div class="selection-grid">
-
-                    <div
-                        class="select-card room"
-                        data-room="Single Room"
-                    >
-
-                        Single Room
-
-                        <div class="card-desc">
-                            Individual booking
-                        </div>
-
+                    <div class="field-title">
+                        Room Type
                     </div>
 
-                    <div
-                        class="select-card room"
-                        data-room="Couple Room"
-                    >
+                    <div class="selection-grid">
 
-                        Couple Room
-
-                        <div class="card-desc">
-                            Automatically 2 pax
-                        </div>
-
-                    </div>
-
-                </div>
-
-
-                <input
-                    type="hidden"
-                    name="room_type"
-                    id="room_type"
-                >
-
-
-                <div
-                    class="schedule-grid"
-                    style="margin-top:18px;"
-                >
-
-
-                    <!-- DATE -->
-
-                    <div class="schedule-block">
-
-                        <label for="booking_date">
-
-                            Appointment Date
-                            <span class="required">*</span>
-
-                        </label>
-
-                        <input
-                            type="date"
-                            id="booking_date"
-                            name="booking_date"
-                            required
+                        <div
+                            class="select-card room"
+                            data-room="Single Room"
                         >
 
-                    </div>
+                            Single Room
+
+                            <div class="card-desc">
+                                Individual booking
+                            </div>
+
+                        </div>
 
 
-                    <!-- PAX -->
-
-                    <div class="schedule-block">
-
-                        <label for="pax">
-
-                            Number of Guests
-                            <span class="required">*</span>
-
-                        </label>
-
-                        <input
-                            type="number"
-                            id="pax"
-                            name="pax"
-                            value="1"
-                            min="1"
-                            max="4"
-                            required
+                        <div
+                            class="select-card room"
+                            data-room="Couple Room"
                         >
 
+                            Couple Room
+
+                            <div class="card-desc">
+                                Automatically 2 pax
+                            </div>
+
+                        </div>
+
+                    </div>
+
+
+                    <input
+                        type="hidden"
+                        name="room_type"
+                        id="room_type"
+                    >
+
+
+                    <div class="schedule-grid schedule-date-guests">
+                        <div>
+                            <label for="booking_date">
+                                Appointment Date <span class="required">*</span>
+                            </label>
+                            <input
+                                type="date"
+                                id="booking_date"
+                                name="booking_date"
+                                required
+                            >
+                        </div>
+
+                        <div>
+                            <label for="pax">
+                                Number of Guests <span class="required">*</span>
+                            </label>
+                            <input
+                                type="number"
+                                id="pax"
+                                name="pax"
+                                value="1"
+                                min="1"
+                                max="4"
+                                required
+                            >
+                            <p class="message" style="margin:6px 0 0;">Select how many guests will book.</p>
+                        </div>
                     </div>
 
 
                 </div>
 
 
-                <!-- TIME -->
+                <!-- =============================================
+                     STEP 1
+                     ============================================= -->
 
-                <div class="field-title">
-                    Available Time
-                </div>
+                <div class="section">
 
-                <div
-                    class="time-grid"
-                    id="timeBox"
-                >
+                    <div class="section-head">
+
+                        <div class="step">
+                            2
+                        </div>
+
+                        <div>
+
+                            <div class="section-title">
+                                Choose Your Service
+                            </div>
+
+                            <div class="section-sub">
+                                Select a category, service,
+                                duration and optional add-ons.
+                            </div>
+
+                        </div>
+
+                    </div>
+
+
+                    <div id="individualGuestServices"></div>
+                    <p class="message" style="margin:8px 0 18px;">Each guest can choose a different service, duration, and add-ons.</p>
+                    <div class="legacy-shared-service" aria-hidden="true">
+                    <!-- CATEGORY -->
+
+                    <div class="field-title">
+                        Category
+                    </div>
+
+                    <div class="selection-grid">
+
+                        <div
+                            class="select-card category"
+                            data-cat="Massage"
+                        >
+                            Massage
+                        </div>
+
+                        <div
+                            class="select-card category"
+                            data-cat="Package"
+                        >
+                            Package
+                        </div>
+
+                        <div
+                            class="select-card category"
+                            data-cat="Promo"
+                        >
+                            Promo
+                        </div>
+
+                    </div>
+
+
+                    <!-- SERVICE -->
+
+                    <div class="field-title">
+                        Service
+                    </div>
 
                     <div
-                        class="message"
-                        style="grid-column:1/-1;"
+                        class="selection-grid"
+                        id="serviceBox"
                     >
-                        Select an appointment
-                        date first.
-                    </div>
 
-                </div>
-
-
-                <input
-                    type="hidden"
-                    name="booking_time"
-                    id="booking_time"
-                >
-
-            </div>
-
-
-            <!-- =====================
-                 STEP 3
-            ====================== -->
-
-            <div class="section">
-
-                <div class="section-head">
-
-                    <div class="step">
-                        3
-                    </div>
-
-                    <div>
-
-                        <div class="section-title">
-                            Choose Your Therapist
-                        </div>
-
-                        <div class="section-sub">
-                            Therapist availability is based
-                            on your selected date, time and
-                            service duration.
+                        <div
+                            class="message"
+                            style="grid-column:1/-1;"
+                        >
+                            Select a category first.
                         </div>
 
                     </div>
 
-                </div>
 
-
-                <div
-                    class="selection-grid"
-                    id="therapistBox"
-                ></div>
-
-
-                <div
-                    id="therapistMessage"
-                    class="message"
-                >
-                    Select a date and time first.
-                </div>
-
-
-                <input
-                    type="hidden"
-                    name="therapist"
-                    id="therapist"
-                >
-
-                <div id="selectedTherapistsInputs"></div>
-
-            </div>
-
-
-            <!-- =====================
-                 STEP 4
-            ====================== -->
-
-            <div class="section">
-
-                <div class="section-head">
-
-                    <div class="step">
-                        4
+                    <div
+                        id="serviceDesc"
+                        class="service-description"
+                    >
+                        Select a service to view
+                        its description.
                     </div>
 
-                    <div>
 
-                        <div class="section-title">
-                            Customer Details
-                        </div>
+                    <!-- DURATION -->
 
-                        <div class="section-sub">
-                            Confirm your contact information
-                            and select your payment method.
+                    <div class="field-title">
+                        Duration
+                    </div>
+
+                    <div
+                        class="selection-grid"
+                        id="durationBox"
+                    >
+
+                        <div
+                            class="message"
+                            style="grid-column:1/-1;"
+                        >
+                            Select a service first.
                         </div>
 
                     </div>
 
+
+                    <!-- ADDONS -->
+
+                    <div class="field-title">
+
+                        Add-ons
+
+                        <span
+                            style="
+                                color:#555;
+                                text-transform:none;
+                            "
+                        >
+                            (Optional)
+                        </span>
+
+                    </div>
+
+                    <div
+                        class="selection-grid"
+                        id="addonBox"
+                    >
+
+                        <div
+                            class="message"
+                            style="grid-column:1/-1;"
+                        >
+                            Add-ons will appear after
+                            selecting a service.
+                        </div>
+
+                    </div>
+
+
+                    <input
+                        type="hidden"
+                        name="addons"
+                        id="addons"
+                    >
+                    </div><!-- legacy shared service controls -->
+
                 </div>
 
 
-                <div class="form-grid">
+                <!-- =============================================
+                     STEP 3
+                     ============================================= -->
+
+                <div class="section">
+
+                    <div class="section-head">
+
+                        <div class="step">
+                            3
+                        </div>
+
+                        <div>
+
+                            <div class="section-title">
+                                Appointment Time & Therapist
+                            </div>
+
+                            <div class="section-sub">
+                                Choose an available time for your selected date and services,
+                                then select a therapist for each guest or choose No Preference.
+                            </div>
+
+                        </div>
+
+                    </div>
 
 
-                    <!-- NAME -->
+                    <!-- TIME -->
 
-                    <div class="form-group">
+                    <div class="field-title">
+                        Available Time
+                    </div>
 
-                        <label>
+                    <div
+                        class="time-grid"
+                        id="timeBox"
+                    >
 
-                            Full Name
-                            <span class="required">*</span>
+                        <div
+                            class="message"
+                            style="grid-column:1/-1;"
+                        >
+                            Select an appointment date first.
+                        </div>
 
-                        </label>
+                    </div>
 
-                        <input
-                            type="text"
-                            name="customer_name"
-                            value="<?= htmlspecialchars($user_name) ?>"
-                            placeholder="Full name"
-                            required
+                    <p class="message">
+                        Note: Please book at least 2 hours before your desired service time.
+                    </p>
+
+                    <input
+                        type="hidden"
+                        name="booking_time"
+                        id="booking_time"
+                    >
+
+
+                    <div id="individualGuestTherapists"></div>
+                    <div class="legacy-shared-therapists" aria-hidden="true">
+                    <div class="therapist-choice">
+
+                        <div
+                            class="select-card therapist-option active"
+                            data-therapist-option="0"
                         >
 
-                    </div>
+                            <strong>
+                                No Preference
+                            </strong>
 
-
-                    <!-- PHONE -->
-
-                    <div class="form-group">
-
-                        <label>
-
-                            Phone Number
-                            <span class="required">*</span>
-
-                        </label>
-
-                        <input
-                            type="text"
-                            name="phone"
-                            value="<?= htmlspecialchars($last_phone) ?>"
-                            placeholder="09XXXXXXXXX"
-                            required
-                        >
-
-                    </div>
-
-
-                    <!-- PER-PAX NAMES -->
-                    <div class="form-group full" id="guestNamesGroup">
-                        <label>Names of Guests <span style="color:#555; text-transform:none;">(required for each guest)</span></label>
-                        <div id="guestNamesFields"></div>
-                        <p class="message">Your Full Name is Guest 1. Enter only the other guests below.</p>
-                    </div>
-
-                    <!-- PAYMENT -->
-
-                    <div class="form-group full">
-
-                        <label>
-
-                            Payment Method
-                            <span class="required">*</span>
-
-                        </label>
-
-                        <select
-                            name="payment_method"
-                            required
-                        >
-
-                            <option value="Cash">
-                                Cash
-                            </option>
-
-                            <option value="GCash">
-                                GCash
-                            </option>
-
-                        </select>
-
-                    </div>
-
-
-                    <!-- NOTES -->
-
-                    <div class="form-group full">
-
-                        <label>
-
-                            Notes / Special Request
-
-                            <span style="color:#555;">
-                                (Optional)
+                            <span class="card-desc">
+                                Any available therapist
                             </span>
 
-                        </label>
+                        </div>
 
-                        <textarea
-                            name="notes"
-                            placeholder="Any additional request for your appointment..."
-                        ></textarea>
+
+                        <div
+                            class="select-card therapist-option"
+                            data-therapist-option="choose"
+                        >
+
+                            <strong>
+                                Choose Therapist
+                            </strong>
+
+                            <span class="card-desc">
+                                Select a specific therapist
+                            </span>
+
+                        </div>
 
                     </div>
 
 
+                    <div
+                        id="therapistList"
+                        class="therapist-list"
+                    ></div>
+
+
+                    <div
+                        id="therapistMessage"
+                        class="message"
+                    >
+                        Select a date and time first
+                        to view therapist availability.
+                    </div>
+
+
+                    <input type="hidden" name="therapist_mode" id="therapist_mode" value="0">
+                    <input type="hidden" name="therapist" id="therapist" value="0">
+                    <div id="therapistInputs"></div>
+                    </div><!-- legacy shared therapist controls -->
+
                 </div>
+
+
+                <!-- =============================================
+                     STEP 4
+                     ============================================= -->
+
+                <div class="section">
+
+                    <div class="section-head">
+
+                        <div class="step">
+                            4
+                        </div>
+
+                        <div>
+
+                            <div class="section-title">
+                                Customer Information
+                            </div>
+
+                            <div class="section-sub">
+                                Your account information is automatically filled in.
+                                Add the names and Wellness Profiles of any
+                                additional guests.
+                            </div>
+
+                        </div>
+
+                    </div>
+
+
+                    <div class="form-grid">
+                        <div class="form-group">
+                            <label>Full Name <span class="required">*</span></label>
+                            <input type="text" name="customer_name" value="<?= htmlspecialchars($user_name, ENT_QUOTES, 'UTF-8') ?>" readonly required>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Phone Number <span class="required">*</span></label>
+                            <input type="text" name="phone" value="<?= htmlspecialchars($last_phone, ENT_QUOTES, 'UTF-8') ?>" placeholder="09XXXXXXXXX" inputmode="numeric" maxlength="11" pattern="09[0-9]{9}" title="Enter an 11-digit Philippine mobile number starting with 09." <?= $last_phone !== '' ? 'readonly' : 'required' ?>>
+                        </div>
+
+                        <div class="form-group full">
+                            <label>Email Address <span class="required">*</span></label>
+                            <input type="email" name="email" value="<?= htmlspecialchars($user_email, ENT_QUOTES, 'UTF-8') ?>" readonly required>
+                        </div>
+
+                        <div class="form-group full" id="guestNamesGroup">
+                            <label>Other Guests' Full Names <span style="color:#555;text-transform:none;">(Guest 2 onward)</span></label>
+                            <div id="guestNamesFields"></div>
+                            <p class="message">Your account name is Guest 1. Enter only the other guests below.</p>
+                        </div>
+
+                        <div class="form-group full">
+                            <div class="section-title" style="margin-bottom:8px;">Wellness Profile</div>
+                            <?php if ($accountProfileReady): ?>
+                                <div class="message" style="margin:0 0 12px;">Your Wellness Profile is saved in your account and will be used for Guest 1. Additional guests must complete their own profile below.</div>
+                                <div id="customerAdditionalTerms" style="display:none;margin:0 0 14px;">
+                                    <details class="wellness-terms-details" style="border:1px solid rgba(214,194,156,.25);border-radius:8px;padding:12px;">
+                                        <summary style="cursor:pointer;color:#D6C29C;font-weight:600;font-size:11px;">Wellness Terms and Conditions (Click to view)</summary>
+                                        <div class="wellness-terms-text" style="max-height:180px;overflow:auto;margin-top:12px;padding:12px;border:1px solid rgba(214,194,156,.18);border-radius:8px;color:#aaa;white-space:pre-line;font-size:12px;line-height:1.7;"></div>
+                                    </details>
+                                    <label style="display:flex;gap:9px;align-items:flex-start;margin-top:10px;text-transform:none;">
+                                        <input type="checkbox" id="customerWellnessTermsAccepted" name="wellness_terms_accepted" value="1" style="width:auto;margin-top:3px;">
+                                        I have read and agree to the Wellness Profile Terms and Conditions. <span class="required">*</span>
+                                    </label>
+                                </div>
+                            <?php else: ?>
+                                <div class="error-box" style="margin:0 0 12px;">Please complete your account Wellness Profile before booking. <a href="wellness-profile.php" style="color:#D6C29C;text-decoration:underline;">Complete Wellness Profile</a></div>
+                            <?php endif; ?>
+                            <div id="guestWellnessProfiles"></div>
+                        </div>
+
+                        <div class="form-group full">
+                            <label>Payment Method <span class="required">*</span></label>
+                            <select name="payment_method" required>
+                                <option value="Cash">Cash</option>
+                                <option value="GCash">GCash</option>
+                            </select>
+                        </div>
+                    </div>
+
+                </div>
+
 
             </div>
 
 
-        </div>
+            <!-- =================================================
+                 SUMMARY
+                 ================================================= -->
+
+            <div>
+
+                <div class="summary-panel">
+
+                    <h3>
+                        Booking Summary
+                    </h3>
+
+                    <div class="summary-sub">
+                        Review your appointment before booking.
+                    </div>
 
 
-        <!-- =========================
-             RIGHT SUMMARY
-        ========================= -->
+                    <div class="summary-row">
 
-        <div class="summary-sticky">
-
-
-            <div
-                class="summary-panel"
-                id="summaryBox"
-            >
-
-                <h3>
-                    Booking Summary
-                </h3>
-
-                <div class="summary-sub">
-                    Review your appointment before booking.
-                </div>
-
-
-                <div class="summary-row">
-
-                    <span class="summary-label">
-                        Service
-                    </span>
-
-                    <span
-                        class="summary-value"
-                        id="sumService"
-                    >
-                        —
-                    </span>
-
-                </div>
-
-
-                <div class="summary-row">
-
-                    <span class="summary-label">
-                        Duration
-                    </span>
-
-                    <span
-                        class="summary-value"
-                        id="sumDuration"
-                    >
-                        —
-                    </span>
-
-                </div>
-
-
-                <div class="summary-row">
-
-                    <span class="summary-label">
-                        Room
-                    </span>
-
-                    <span
-                        class="summary-value"
-                        id="sumRoom"
-                    >
-                        —
-                    </span>
-
-                </div>
-
-
-                <div class="summary-row">
-
-                    <span class="summary-label">
-                        Date
-                    </span>
-
-                    <span
-                        class="summary-value"
-                        id="sumDate"
-                    >
-                        —
-                    </span>
-
-                </div>
-
-
-                <div class="summary-row">
-
-                    <span class="summary-label">
-                        Time
-                    </span>
-
-                    <span
-                        class="summary-value"
-                        id="sumTime"
-                    >
-                        —
-                    </span>
-
-                </div>
-
-
-                <div class="summary-row">
-
-                    <span class="summary-label">
-                        Therapist
-                    </span>
-
-                    <span
-                        class="summary-value"
-                        id="sumTherapist"
-                    >
-                        —
-                    </span>
-
-                </div>
-
-
-                <div class="summary-row">
-
-                    <span class="summary-label">
-                        Add-ons
-                    </span>
-
-                    <span
-                        class="summary-value summary-addons"
-                        id="sumAddons"
-                    >
-                        None
-                    </span>
-
-                </div>
-
-
-                <!-- PRICE -->
-
-                <div class="price-area">
-
-                    <div class="price-line">
-
-                        <span>
+                        <span class="summary-label">
                             Service
                         </span>
 
-                        <span id="sumBasePrice">
-                            ₱0.00
+                        <span
+                            class="summary-value"
+                            id="sumService"
+                        >
+                            —
                         </span>
 
                     </div>
 
 
-                    <div class="price-line">
+                    <div class="summary-row">
 
-                        <span>
-                            Add-ons
-                        </span>
-
-                        <span id="sumAddonPrice">
-                            ₱0.00
-                        </span>
-
-                    </div>
-
-
-                    <div class="total-line">
-
-                        <span class="total-label">
-                            Total
+                        <span class="summary-label">
+                            Duration
                         </span>
 
                         <span
-                            class="total-price"
-                            id="sumTotal"
+                            class="summary-value"
+                            id="sumDuration"
                         >
-                            ₱0.00
+                            —
                         </span>
 
                     </div>
 
-                </div>
+
+                    <div class="summary-row">
+
+                        <span class="summary-label">
+                            Room
+                        </span>
+
+                        <span
+                            class="summary-value"
+                            id="sumRoom"
+                        >
+                            —
+                        </span>
+
+                    </div>
 
 
-                <button
-                    class="book-btn"
-                    type="submit"
-                    name="submit_booking"
-                >
-                    Confirm Booking
-                </button>
+                    <div class="summary-row">
+
+                        <span class="summary-label">
+                            Guests
+                        </span>
+
+                        <span
+                            class="summary-value"
+                            id="sumPax"
+                        >
+                            1
+                        </span>
+
+                    </div>
 
 
-                <div class="booking-note">
-                    Your booking will initially be
-                    submitted as Pending.
+                    <div class="summary-row">
+
+                        <span class="summary-label">
+                            Date
+                        </span>
+
+                        <span
+                            class="summary-value"
+                            id="sumDate"
+                        >
+                            —
+                        </span>
+
+                    </div>
+
+
+                    <div class="summary-row">
+
+                        <span class="summary-label">
+                            Time
+                        </span>
+
+                        <span
+                            class="summary-value"
+                            id="sumTime"
+                        >
+                            —
+                        </span>
+
+                    </div>
+
+
+                    <div class="summary-row">
+
+                        <span class="summary-label">
+                            Therapist
+                        </span>
+
+                        <span
+                            class="summary-value"
+                            id="sumTherapist"
+                        >
+                            No Preference
+                        </span>
+
+                    </div>
+
+
+                    <div class="summary-row">
+
+                        <span class="summary-label">
+                            Add-ons
+                        </span>
+
+                        <span
+                            class="summary-value summary-addons"
+                            id="sumAddons"
+                        >
+                            None
+                        </span>
+
+                    </div>
+
+
+                    <div class="price-area">
+
+
+                        <div class="price-line">
+
+                            <span>
+                                Service
+                            </span>
+
+                            <span id="sumBasePrice">
+                                ₱0.00
+                            </span>
+
+                        </div>
+
+
+                        <div class="price-line">
+
+                            <span>
+                                Add-ons
+                            </span>
+
+                            <span id="sumAddonPrice">
+                                ₱0.00
+                            </span>
+
+                        </div>
+
+
+                        <div class="total-line">
+
+                            <span class="total-label">
+                                Total
+                            </span>
+
+                            <span
+                                class="total-price"
+                                id="sumTotal"
+                            >
+                                ₱0.00
+                            </span>
+
+                        </div>
+
+
+                    </div>
+
+
+                    <button
+                        type="submit"
+                        name="submit_booking"
+                        class="book-btn"
+                    >
+                        Confirm Booking
+                    </button>
+
+
+                    <div class="booking-note">
+                        No account is required. Your booking
+                        will initially be submitted as Confirmation.
+                    </div>
+
                 </div>
 
             </div>
@@ -2146,50 +2593,89 @@ input[type="date"]::-webkit-calendar-picker-indicator {
         </div>
 
 
-    </div>
+        <!-- =================================================
+             HIDDEN VALUES
+             ================================================= -->
 
+        <input
+            type="hidden"
+            name="service_id"
+            id="service_id"
+        >
 
-    <!-- =========================
-         HIDDEN VALUES
-    ========================= -->
+        <input
+            type="hidden"
+            name="service"
+            id="service"
+        >
 
-    <input
-        type="hidden"
-        name="service_id"
-        id="service_id"
-    >
+        <input
+            type="hidden"
+            name="duration"
+            id="duration"
+        >
 
-    <input
-        type="hidden"
-        name="service"
-        id="service"
-    >
-
-    <input
-        type="hidden"
-        name="duration"
-        id="duration"
-    >
-
-    <input
-        type="hidden"
-        name="price"
-        id="price"
-        value="0"
-    >
+        <input
+            type="hidden"
+            name="price"
+            id="price"
+            value="0"
+        >
 
 
     </form>
 
-
 </div>
 
 
+
+<!-- Modern dialog used by guest-booking validation messages. -->
+<div class="mizpah-dialog-backdrop" id="mizpahDialogBackdrop" aria-hidden="true">
+  <div class="mizpah-dialog" role="alertdialog" aria-modal="true" aria-labelledby="mizpahDialogTitle" aria-describedby="mizpahDialogMessage">
+    <div class="mizpah-dialog-icon" aria-hidden="true">!</div>
+    <h2 id="mizpahDialogTitle">Mizpah Wellness Spa</h2>
+    <p id="mizpahDialogMessage"></p>
+    <button type="button" class="mizpah-dialog-button" id="mizpahDialogOk">OK</button>
+  </div>
+</div>
+
 <script>
 
-/* =========================
-   ELEMENTS
-========================= */
+(function () {
+    const backdrop = document.getElementById('mizpahDialogBackdrop');
+    const messageBox = document.getElementById('mizpahDialogMessage');
+    const okButton = document.getElementById('mizpahDialogOk');
+    if (!backdrop || !messageBox || !okButton) return;
+
+    let previousFocus = null;
+    function closeMizpahDialog() {
+        backdrop.classList.remove('is-visible');
+        backdrop.setAttribute('aria-hidden', 'true');
+        if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
+    }
+
+    // Existing alert(message) calls now display this custom modal.
+    window.alert = function (message) {
+        previousFocus = document.activeElement;
+        messageBox.textContent = String(message);
+        backdrop.classList.add('is-visible');
+        backdrop.setAttribute('aria-hidden', 'false');
+        okButton.focus();
+    };
+
+    okButton.addEventListener('click', closeMizpahDialog);
+    backdrop.addEventListener('click', function (event) {
+        if (event.target === backdrop) closeMizpahDialog();
+    });
+    document.addEventListener('keydown', function (event) {
+        if (event.key === 'Escape' && backdrop.classList.contains('is-visible')) closeMizpahDialog();
+    });
+})();
+
+
+/* =========================================================
+   DOM
+   ========================================================= */
 
 const serviceBox =
     document.getElementById('serviceBox');
@@ -2206,28 +2692,8 @@ const addonBox =
 const timeBox =
     document.getElementById('timeBox');
 
-const therapistBox =
-    document.getElementById('therapistBox');
-
-// customerPaxMaxFourApplied: keep the customer form limited to four guests.
-const customerPaxInput = document.getElementById('pax');
-if (customerPaxInput) {
-    customerPaxInput.max = '4';
-    customerPaxInput.addEventListener('input', function () {
-        const value = parseInt(this.value || '1', 10);
-        if (value > 4) this.value = '4';
-        if (value < 1) this.value = '1';
-        const limit = Math.max(1, Math.min(4, Number(this.value || 1)));
-        if (selectedTherapistIds.length > limit) {
-            selectedTherapistIds = selectedTherapistIds.slice(0, limit);
-            syncSelectedTherapists();
-            therapistBox.querySelectorAll('.therapist').forEach(card => {
-                card.classList.toggle('active', selectedTherapistIds.includes(String(card.dataset.id)));
-            });
-            updateTherapistSummary(selectedTherapistIds.map(id => therapistBox.querySelector('.therapist[data-id="' + id + '"]')?.dataset.name || id));
-        }
-    });
-}
+const therapistList =
+    document.getElementById('therapistList');
 
 const therapistMessage =
     document.getElementById('therapistMessage');
@@ -2258,24 +2724,10 @@ const bookingTime =
 
 const therapistInput =
     document.getElementById('therapist');
-
+const therapistModeInput = document.getElementById('therapist_mode');
+const therapistInputs = document.getElementById('therapistInputs');
 let selectedTherapistIds = [];
-const selectedTherapistsInputs = document.getElementById('selectedTherapistsInputs');
-
-function syncSelectedTherapists() {
-    therapistInput.value = selectedTherapistIds.length ? selectedTherapistIds[0] : '0';
-    selectedTherapistsInputs.innerHTML = '';
-    selectedTherapistIds.forEach(id => {
-        const input = document.createElement('input');
-        input.type = 'hidden'; input.name = 'therapists[]'; input.value = id;
-        selectedTherapistsInputs.appendChild(input);
-    });
-}
-
-function updateTherapistSummary(names) {
-    summary.therapist = names.length ? names.join(', ') : 'No Preference';
-    renderSummary();
-}
+let selectedTherapistNames = [];
 
 const paxInput =
     document.getElementById('pax');
@@ -2304,34 +2756,36 @@ function renderGuestNameFields() {
 
 
 
-/* =========================
-   PRICE VARIABLES
-========================= */
+/* =========================================================
+   PRICE
+   ========================================================= */
 
 let basePrice = 0;
 
 let addonTotal = 0;
 
 
-/* =========================
-   SUMMARY
-========================= */
+/* =========================================================
+   SUMMARY DATA
+   ========================================================= */
 
 let summary = {
 
-    service:'—',
+    service: '—',
 
-    duration:'—',
+    duration: '—',
 
-    room:'—',
+    room: '—',
 
-    date:'—',
+    pax: '1',
 
-    time:'—',
+    date: '—',
 
-    therapist:'—',
+    time: '—',
 
-    addons:'None'
+    therapist: 'No Preference',
+
+    addons: 'None'
 
 };
 
@@ -2369,6 +2823,11 @@ function renderSummary(){
         summary.room;
 
     document.getElementById(
+        'sumPax'
+    ).textContent =
+        summary.pax;
+
+    document.getElementById(
         'sumDate'
     ).textContent =
         summary.date;
@@ -2394,15 +2853,14 @@ function renderSummary(){
     ).textContent =
         money(basePrice);
 
+
     document.getElementById(
         'sumAddonPrice'
     ).textContent =
         money(addonTotal);
 
 
-    const perGuestTotal = Number(basePrice) + Number(addonTotal);
-    const guestCount = roomInput?.value === 'Couple Room' ? 2 : Math.max(1, Number(paxInput?.value || 1));
-    const total = perGuestTotal * guestCount;
+    const total = Number(basePrice) + Number(addonTotal);
 
 
     document.getElementById(
@@ -2412,7 +2870,9 @@ function renderSummary(){
 
 
     /*
-       SAVE TOTAL TO BOOKING PRICE
+       IMPORTANT:
+       Save complete total:
+       service/duration + add-ons
     */
 
     priceInput.value =
@@ -2421,9 +2881,9 @@ function renderSummary(){
 }
 
 
-/* =========================
-   RESET AFTER CATEGORY
-========================= */
+/* =========================================================
+   RESET SERVICE
+   ========================================================= */
 
 function resetServiceSelection(){
 
@@ -2433,11 +2893,12 @@ function resetServiceSelection(){
 
     durationInput.value = '';
 
+    addonsInput.value = '';
+
     basePrice = 0;
 
     addonTotal = 0;
 
-    addonsInput.value = '';
 
     summary.service = '—';
 
@@ -2445,23 +2906,40 @@ function resetServiceSelection(){
 
     summary.addons = 'None';
 
+
     serviceDesc.textContent =
         'Select a service to view its description.';
 
-    durationBox.innerHTML =
-        '<div class="message" style="grid-column:1/-1;">Select a service first.</div>';
 
-    addonBox.innerHTML =
-        '<div class="message" style="grid-column:1/-1;">Add-ons will appear after selecting a service.</div>';
+    durationBox.innerHTML = `
+        <div
+            class="message"
+            style="grid-column:1/-1;"
+        >
+            Select a service first.
+        </div>
+    `;
+
+
+    addonBox.innerHTML = `
+        <div
+            class="message"
+            style="grid-column:1/-1;"
+        >
+            Add-ons will appear after
+            selecting a service.
+        </div>
+    `;
+
 
     renderSummary();
 
 }
 
 
-/* =========================
+/* =========================================================
    CATEGORY
-========================= */
+   ========================================================= */
 
 document.addEventListener(
     'click',
@@ -2477,7 +2955,7 @@ document.addEventListener(
 
         document
         .querySelectorAll('.category')
-        .forEach(card => {
+        .forEach(function(card){
 
             card.classList.remove(
                 'active'
@@ -2494,8 +2972,14 @@ document.addEventListener(
         resetServiceSelection();
 
 
-        serviceBox.innerHTML =
-            '<div class="message" style="grid-column:1/-1;">Loading services...</div>';
+        serviceBox.innerHTML = `
+            <div
+                class="message"
+                style="grid-column:1/-1;"
+            >
+                Loading services...
+            </div>
+        `;
 
 
         fetch(
@@ -2505,11 +2989,11 @@ document.addEventListener(
             )
         )
 
-        .then(response =>
-            response.json()
-        )
+        .then(function(response){
+            return response.json();
+        })
 
-        .then(data => {
+        .then(function(data){
 
             serviceBox.innerHTML = '';
 
@@ -2519,35 +3003,46 @@ document.addEventListener(
                 data.length === 0
             ){
 
-                serviceBox.innerHTML =
-                    '<div class="message" style="grid-column:1/-1;">No services available in this category.</div>';
+                serviceBox.innerHTML = `
+                    <div
+                        class="message"
+                        style="grid-column:1/-1;"
+                    >
+                        No services available.
+                    </div>
+                `;
 
                 return;
 
             }
 
 
-            data.forEach(s => {
+            data.forEach(function(service){
 
                 const card =
                     document.createElement(
                         'div'
                     );
 
+
                 card.className =
                     'select-card service';
 
+
                 card.dataset.id =
-                    s.id;
+                    service.id;
+
 
                 card.dataset.name =
-                    s.service_name;
+                    service.service_name;
+
 
                 card.dataset.desc =
-                    s.description || '';
+                    service.description || '';
+
 
                 card.textContent =
-                    s.service_name;
+                    service.service_name;
 
 
                 serviceBox.appendChild(
@@ -2558,15 +3053,22 @@ document.addEventListener(
 
         })
 
-        .catch(error => {
+        .catch(function(error){
 
             console.error(
                 'Service error:',
                 error
             );
 
-            serviceBox.innerHTML =
-                '<div class="message" style="grid-column:1/-1;">Unable to load services.</div>';
+
+            serviceBox.innerHTML = `
+                <div
+                    class="message"
+                    style="grid-column:1/-1;"
+                >
+                    Unable to load services.
+                </div>
+            `;
 
         });
 
@@ -2574,9 +3076,9 @@ document.addEventListener(
 );
 
 
-/* =========================
+/* =========================================================
    SERVICE
-========================= */
+   ========================================================= */
 
 document.addEventListener(
     'click',
@@ -2592,7 +3094,7 @@ document.addEventListener(
 
         document
         .querySelectorAll('.service')
-        .forEach(card => {
+        .forEach(function(card){
 
             card.classList.remove(
                 'active'
@@ -2609,6 +3111,7 @@ document.addEventListener(
         serviceIdInput.value =
             selectedService.dataset.id;
 
+
         serviceInput.value =
             selectedService.dataset.name;
 
@@ -2621,27 +3124,37 @@ document.addEventListener(
         summary.service =
             selectedService.dataset.name;
 
+
         summary.duration = '—';
 
         summary.addons = 'None';
+
 
         durationInput.value = '';
 
         addonsInput.value = '';
 
+
         basePrice = 0;
 
         addonTotal = 0;
 
+
         renderSummary();
 
 
-        /* =====================
+        /* =============================================
            LOAD DURATION
-        ====================== */
+           ============================================= */
 
-        durationBox.innerHTML =
-            '<div class="message" style="grid-column:1/-1;">Loading durations...</div>';
+        durationBox.innerHTML = `
+            <div
+                class="message"
+                style="grid-column:1/-1;"
+            >
+                Loading durations...
+            </div>
+        `;
 
 
         fetch(
@@ -2651,11 +3164,11 @@ document.addEventListener(
             )
         )
 
-        .then(response =>
-            response.json()
-        )
+        .then(function(response){
+            return response.json();
+        })
 
-        .then(data => {
+        .then(function(data){
 
             durationBox.innerHTML = '';
 
@@ -2665,26 +3178,35 @@ document.addEventListener(
                 data.length === 0
             ){
 
-                durationBox.innerHTML =
-                    '<div class="message" style="grid-column:1/-1;">No duration available.</div>';
+                durationBox.innerHTML = `
+                    <div
+                        class="message"
+                        style="grid-column:1/-1;"
+                    >
+                        No duration available.
+                    </div>
+                `;
 
                 return;
 
             }
 
 
-            data.forEach(item => {
+            data.forEach(function(item){
 
                 const card =
                     document.createElement(
                         'div'
                     );
 
+
                 card.className =
                     'select-card duration';
 
+
                 card.dataset.duration =
                     item.duration;
+
 
                 card.dataset.price =
                     item.price;
@@ -2707,36 +3229,51 @@ document.addEventListener(
 
             });
 
+            // Packages use their fixed duration automatically when only one duration is available.
+            const selectedCategory = document.querySelector('.category.active');
+            if (selectedCategory && selectedCategory.dataset.cat === 'Package' && data.length === 1) {
+                const onlyDuration = durationBox.querySelector('.duration');
+                if (onlyDuration) {
+                    onlyDuration.click();
+                    onlyDuration.style.pointerEvents = 'none';
+                    onlyDuration.style.cursor = 'default';
+                    onlyDuration.title = 'Package duration is fixed.';
+                }
+            }
+
         })
 
-        .catch(error => {
+        .catch(function(error){
 
             console.error(
                 'Duration error:',
                 error
             );
 
-            durationBox.innerHTML =
-                '<div class="message" style="grid-column:1/-1;">Unable to load durations.</div>';
-
         });
 
 
-        /* =====================
+        /* =============================================
            LOAD ADDONS
-        ====================== */
+           ============================================= */
 
-        addonBox.innerHTML =
-            '<div class="message" style="grid-column:1/-1;">Loading add-ons...</div>';
+        addonBox.innerHTML = `
+            <div
+                class="message"
+                style="grid-column:1/-1;"
+            >
+                Loading add-ons...
+            </div>
+        `;
 
 
         fetch('../get_addons.php')
 
-        .then(response =>
-            response.json()
-        )
+        .then(function(response){
+            return response.json();
+        })
 
-        .then(data => {
+        .then(function(data){
 
             addonBox.innerHTML = '';
 
@@ -2746,26 +3283,35 @@ document.addEventListener(
                 data.length === 0
             ){
 
-                addonBox.innerHTML =
-                    '<div class="message" style="grid-column:1/-1;">No add-ons available.</div>';
+                addonBox.innerHTML = `
+                    <div
+                        class="message"
+                        style="grid-column:1/-1;"
+                    >
+                        No add-ons available.
+                    </div>
+                `;
 
                 return;
 
             }
 
 
-            data.forEach(addon => {
+            data.forEach(function(addon){
 
                 const card =
                     document.createElement(
                         'div'
                     );
 
+
                 card.className =
                     'select-card addon';
 
+
                 card.dataset.name =
                     addon.service_name;
+
 
                 card.dataset.price =
                     addon.price;
@@ -2783,9 +3329,11 @@ document.addEventListener(
                     ${
                         addon.description
                         ?
-                        `<span class="card-desc">
-                            ${addon.description}
-                        </span>`
+                        `
+                            <span class="card-desc">
+                                ${addon.description}
+                            </span>
+                        `
                         :
                         ''
                     }
@@ -2800,15 +3348,12 @@ document.addEventListener(
 
         })
 
-        .catch(error => {
+        .catch(function(error){
 
             console.error(
-                'Addon error:',
+                'Add-ons error:',
                 error
             );
-
-            addonBox.innerHTML =
-                '<div class="message" style="grid-column:1/-1;">Unable to load add-ons.</div>';
 
         });
 
@@ -2816,9 +3361,9 @@ document.addEventListener(
 );
 
 
-/* =========================
+/* =========================================================
    DURATION
-========================= */
+   ========================================================= */
 
 document.addEventListener(
     'click',
@@ -2834,7 +3379,7 @@ document.addEventListener(
 
         document
         .querySelectorAll('.duration')
-        .forEach(card => {
+        .forEach(function(card){
 
             card.classList.remove(
                 'active'
@@ -2866,8 +3411,7 @@ document.addEventListener(
 
 
         /*
-           Reload therapists because
-           duration affects availability.
+           Duration can affect therapist availability.
         */
 
         if(
@@ -2875,10 +3419,25 @@ document.addEventListener(
             bookingTime.value
         ){
 
-            loadTherapists(
-                bookingDate.value,
-                bookingTime.value
-            );
+            const chooseOption =
+                document.querySelector(
+                    '.therapist-option[data-therapist-option="choose"]'
+                );
+
+
+            if(
+                chooseOption &&
+                chooseOption.classList.contains(
+                    'active'
+                )
+            ){
+
+                loadTherapists(
+                    bookingDate.value,
+                    bookingTime.value
+                );
+
+            }
 
         }
 
@@ -2886,9 +3445,9 @@ document.addEventListener(
 );
 
 
-/* =========================
+/* =========================================================
    ADD-ONS
-========================= */
+   ========================================================= */
 
 document.addEventListener(
     'click',
@@ -2907,7 +3466,7 @@ document.addEventListener(
         );
 
 
-        let names = [];
+        const names = [];
 
         addonTotal = 0;
 
@@ -2916,11 +3475,12 @@ document.addEventListener(
         .querySelectorAll(
             '.addon.active'
         )
-        .forEach(card => {
+        .forEach(function(card){
 
             names.push(
                 card.dataset.name
             );
+
 
             addonTotal +=
                 parseFloat(
@@ -2946,25 +3506,25 @@ document.addEventListener(
 );
 
 
-/* =========================
+/* =========================================================
    ROOM
-========================= */
+   ========================================================= */
 
 document.addEventListener(
     'click',
     function(e){
 
-        const room =
+        const selectedRoom =
             e.target.closest('.room');
 
-        if(!room){
+        if(!selectedRoom){
             return;
         }
 
 
         document
         .querySelectorAll('.room')
-        .forEach(card => {
+        .forEach(function(card){
 
             card.classList.remove(
                 'active'
@@ -2973,21 +3533,22 @@ document.addEventListener(
         });
 
 
-        room.classList.add(
+        selectedRoom.classList.add(
             'active'
         );
 
 
         roomInput.value =
-            room.dataset.room;
+            selectedRoom.dataset.room;
 
 
         summary.room =
-            room.dataset.room;
+            selectedRoom.dataset.room;
+        selectedTherapistIds = []; selectedTherapistNames = []; therapistInputs.innerHTML = ''; therapistInput.value='0'; therapistModeInput.value='0';
 
 
         if(
-            room.dataset.room ===
+            selectedRoom.dataset.room ===
             'Couple Room'
         ){
 
@@ -2995,18 +3556,23 @@ document.addEventListener(
 
             paxInput.readOnly = true;
 
+            summary.pax = '2';
+
         }else{
 
             paxInput.value = 1;
 
             paxInput.readOnly = false;
 
+            summary.pax = '1';
+
         }
 
 
         renderSummary();
 
-        // Re-check the selected date using the newly selected room type.
+        // Room capacity and slot counts depend on the selected room and pax.
+        // Reload the available times immediately when the room changes.
         if (bookingDate.value) {
             bookingDate.dispatchEvent(new Event('change'));
         }
@@ -3015,71 +3581,248 @@ document.addEventListener(
 );
 
 
-/* =========================
-   MINIMUM DATE
-========================= */
+/* =========================================================
+   PAX
+   ========================================================= */
+
+paxInput.addEventListener(
+    'input',
+    function(){
+
+        let value =
+            parseInt(
+                paxInput.value
+            ) || 1;
+
+
+        if(value < 1){
+            value = 1;
+        }
+
+
+        if(value > 4){
+            value = 4;
+        }
+
+
+        paxInput.value = value;
+
+        summary.pax =
+            String(value);
+        selectedTherapistIds = []; selectedTherapistNames = []; therapistInputs.innerHTML=''; therapistInput.value='0';
+        document.querySelectorAll('.therapist-card.active').forEach(function(c){c.classList.remove('active');});
+        if (therapistModeInput.value === 'choose' && bookingDate.value && bookingTime.value) loadTherapists(bookingDate.value, bookingTime.value);
+
+
+        renderSummary();
+
+    }
+);
+
+
+/* =========================================================
+   MIN DATE
+   ========================================================= */
 
 const today =
     new Date();
 
+
 const year =
     today.getFullYear();
+
 
 const month =
     String(
         today.getMonth() + 1
-    ).padStart(2,'0');
+    ).padStart(
+        2,
+        '0'
+    );
+
 
 const day =
     String(
         today.getDate()
-    ).padStart(2,'0');
+    ).padStart(
+        2,
+        '0'
+    );
+
 
 bookingDate.min =
     `${year}-${month}-${day}`;
 
 
-/* =========================
-   RESET THERAPIST
-========================= */
+/* =========================================================
+   THERAPIST RESET
+   ========================================================= */
 
-function resetTherapistDisplay(){
+function resetTherapist(){
 
-    therapistBox.innerHTML = '';
+    document
+    .querySelectorAll(
+        '.therapist-option'
+    )
+    .forEach(function(card){
+
+        card.classList.remove(
+            'active'
+        );
+
+    });
+
+
+    const noPreference =
+        document.querySelector(
+            '.therapist-option[data-therapist-option="0"]'
+        );
+
+
+    if(noPreference){
+
+        noPreference.classList.add(
+            'active'
+        );
+
+    }
+
+
+    therapistInput.value = '0';
+    therapistModeInput.value = '0';
+    selectedTherapistIds = [];
+    selectedTherapistNames = [];
+    therapistInputs.innerHTML = '';
+    therapistList.innerHTML = '';
+
+    summary.therapist = 'No Preference';
+
 
     therapistMessage.textContent =
-        'Select a time to view available therapists.';
+        'Select a date and time first to view therapist availability.';
 
-    selectedTherapistIds = [];
-    syncSelectedTherapists();
-
-    summary.therapist = '—';
 
     renderSummary();
 
 }
 
 
-/* =========================
+/* =========================================================
+   THERAPIST OPTION
+   ========================================================= */
+
+document.addEventListener(
+    'click',
+    function(e){
+
+        const option =
+            e.target.closest(
+                '.therapist-option'
+            );
+
+        if(!option){
+            return;
+        }
+
+
+        document
+        .querySelectorAll(
+            '.therapist-option'
+        )
+        .forEach(function(card){
+
+            card.classList.remove(
+                'active'
+            );
+
+        });
+
+
+        option.classList.add(
+            'active'
+        );
+
+
+        const value =
+            option.dataset.therapistOption;
+
+
+        if(value === '0'){
+
+            therapistInput.value = '0';
+            therapistModeInput.value = '0';
+            selectedTherapistIds = []; selectedTherapistNames = []; therapistInputs.innerHTML = '';
+
+            therapistList.innerHTML = '';
+
+
+            summary.therapist =
+                'No Preference';
+
+
+            therapistMessage.textContent =
+                'No Preference selected. Any available therapist may be assigned.';
+
+
+            renderSummary();
+
+            return;
+
+        }
+
+
+        if(value === 'choose'){
+
+            therapistInput.value = '0';
+            therapistModeInput.value = 'choose';
+            selectedTherapistIds = []; selectedTherapistNames = []; therapistInputs.innerHTML = '';
+
+            summary.therapist =
+                'No Preference';
+
+
+            renderSummary();
+
+
+            if(
+                !bookingDate.value ||
+                !bookingTime.value
+            ){
+
+                therapistList.innerHTML = '';
+
+                therapistMessage.textContent =
+                    'Please select a date and time first.';
+
+                return;
+
+            }
+
+
+            loadTherapists(
+                bookingDate.value,
+                bookingTime.value
+            );
+
+        }
+
+    }
+);
+
+
+/* =========================================================
    LOAD THERAPISTS
-========================= */
+   ========================================================= */
 
 function loadTherapists(
     selectedDate,
     selectedTime
 ){
 
-    therapistBox.innerHTML = '';
+    therapistList.innerHTML = '';
 
     therapistMessage.textContent =
         'Loading therapists...';
-
-    selectedTherapistIds = [];
-    syncSelectedTherapists();
-
-    summary.therapist = '—';
-
-    renderSummary();
 
 
     let selectedDuration =
@@ -3102,13 +3845,13 @@ function loadTherapists(
         )
     )
 
-    .then(response =>
-        response.json()
-    )
+    .then(function(response){
+        return response.json();
+    })
 
-    .then(data => {
+    .then(function(data){
 
-        therapistBox.innerHTML = '';
+        therapistList.innerHTML = '';
 
 
         if(
@@ -3125,34 +3868,26 @@ function loadTherapists(
 
 
         therapistMessage.textContent =
-            'Choose up to the number of guests, or select No Preference.';
+            'Select an available therapist.';
 
-        const noPref = document.createElement('div');
-        noPref.className = 'select-card therapist active';
-        noPref.dataset.id = '0';
-        noPref.dataset.name = 'No Preference';
-        noPref.innerHTML = '<strong>No Preference</strong><div class="card-desc">Assign later</div>';
-        noPref.onclick = function(){
-            selectedTherapistIds = [];
-            syncSelectedTherapists();
-            therapistBox.querySelectorAll('.therapist').forEach(item => item.classList.remove('active'));
-            noPref.classList.add('active');
-            updateTherapistSummary([]);
-        };
-        therapistBox.appendChild(noPref);
 
-        data.forEach(t => {
+        data.forEach(function(therapist){
 
-            let therapistName =
-                t.name ?? t;
+            const therapistId =
+                therapist.id ?? '';
 
-            let therapistId =
-                t.id ?? '';
 
-            let isAvailable =
-                t.available === undefined
+            const therapistName =
+                therapist.name ||
+                'Unnamed Therapist';
+
+
+            const isAvailable =
+                therapist.available === undefined
                 ? true
-                : Boolean(t.available);
+                : Boolean(
+                    therapist.available
+                );
 
 
             const card =
@@ -3162,37 +3897,15 @@ function loadTherapists(
 
 
             card.className =
-                'select-card therapist';
+                'select-card therapist-card';
 
 
-            card.dataset.id =
+            card.dataset.therapistId =
                 therapistId;
 
-            card.dataset.name =
+
+            card.dataset.therapistName =
                 therapistName;
-
-
-            card.innerHTML = `
-
-                <strong>
-                    ${therapistName}
-                </strong>
-
-                <div class="card-desc ${
-                    isAvailable
-                    ? 'available-text'
-                    : 'unavailable-text'
-                }">
-
-                    ${
-                        isAvailable
-                        ? 'Available'
-                        : 'Booked / Unavailable'
-                    }
-
-                </div>
-
-            `;
 
 
             if(!isAvailable){
@@ -3201,41 +3914,81 @@ function loadTherapists(
                     'unavailable'
                 );
 
-                card.style.pointerEvents =
-                    'none';
+
+                card.innerHTML = `
+
+                    <strong>
+                        ${therapistName}
+                    </strong>
+
+                    <span
+                        class="
+                            card-desc
+                            unavailable-text
+                        "
+                    >
+                        Booked / Unavailable
+                    </span>
+
+                `;
 
             }else{
 
-                card.onclick = function(){
-                const id = String(therapistId);
-                const maxPick = Math.max(1, Math.min(4, Number(document.getElementById('pax')?.value || 1)));
-                const index = selectedTherapistIds.indexOf(id);
-                if (index >= 0) {
-                    selectedTherapistIds.splice(index, 1);
-                    card.classList.remove('active');
-                } else {
-                    if (selectedTherapistIds.length >= maxPick) {
-                        alert('You can select up to ' + maxPick + ' therapist(s) for ' + maxPick + ' guest(s).');
-                        return;
+                card.innerHTML = `
+
+                    <strong>
+                        ${therapistName}
+                    </strong>
+
+                    <span
+                        class="
+                            card-desc
+                            available-text
+                        "
+                    >
+                        Available
+                    </span>
+
+                `;
+
+
+                card.addEventListener(
+                    'click',
+                    function(){
+
+                        const id = String(therapistId);
+                        const pos = selectedTherapistIds.indexOf(id);
+                        const maxPick = Number(paxInput.value || 1);
+                        if (pos >= 0) {
+                            selectedTherapistIds.splice(pos, 1);
+                            selectedTherapistNames.splice(pos, 1);
+                            card.classList.remove('active');
+                        } else {
+                            if (selectedTherapistIds.length >= maxPick) {
+                                alert('Select only ' + maxPick + ' therapist(s) for this booking.');
+                                return;
+                            }
+                            selectedTherapistIds.push(id);
+                            selectedTherapistNames.push(therapistName);
+                            card.classList.add('active');
+                        }
+                        therapistInput.value = selectedTherapistIds[0] || '0';
+                        therapistInputs.innerHTML = selectedTherapistIds.map(function(tid){
+                            return '<input type="hidden" name="therapists[]" value="' + tid + '">';
+                        }).join('');
+                        summary.therapist = selectedTherapistIds.length
+                            ? selectedTherapistNames.join(', ') + ' (' + selectedTherapistIds.length + '/' + maxPick + ')'
+                            : 'Select ' + maxPick + ' therapist(s)';
+                        therapistMessage.textContent = 'Selected ' + selectedTherapistIds.length + ' of ' + maxPick + ' therapist(s).';
+                        renderSummary();
+
                     }
-                    selectedTherapistIds.push(id);
-                    card.classList.add('active');
-                }
-                // Choosing a named therapist clears No Preference.
-                const noPref = therapistBox.querySelector('[data-id="0"]');
-                if (noPref) noPref.classList.remove('active');
-                syncSelectedTherapists();
-                const names = selectedTherapistIds.map(selectedId => {
-                    const selectedCard = therapistBox.querySelector('.therapist[data-id="' + selectedId + '"]');
-                    return selectedCard?.dataset.name || selectedId;
-                });
-                updateTherapistSummary(names);
-            };
+                );
 
             }
 
 
-            therapistBox.appendChild(
+            therapistList.appendChild(
                 card
             );
 
@@ -3243,7 +3996,7 @@ function loadTherapists(
 
     })
 
-    .catch(error => {
+    .catch(function(error){
 
         console.error(
             'Therapist error:',
@@ -3251,11 +4004,11 @@ function loadTherapists(
         );
 
 
-        therapistBox.innerHTML = '';
+        therapistList.innerHTML = '';
 
 
         therapistMessage.textContent =
-            'Unable to load therapists.';
+            'Unable to load therapists. Please try again.';
 
     });
 
@@ -3266,34 +4019,35 @@ function getOpeningHour(dateString) {
     const d = new Date(dateString + 'T12:00:00');
     return (d.getDay() === 0 || d.getDay() === 6) ? 13 : 15;
 }
-function selectedTimeDate(dateString, timeString) {
-    const [h, m] = timeString.split(':').map(Number);
-    const d = new Date(dateString + 'T00:00:00');
-    d.setHours(h, m, 0, 0);
-    if (h < getOpeningHour(dateString)) d.setDate(d.getDate() + 1);
-    return d;
-}
-function slotHasLeadTime(dateString, timeString) {
-    return selectedTimeDate(dateString, timeString).getTime() >= Date.now() + 2 * 60 * 60 * 1000;
-}
 function durationHours(value) {
     const text = String(value || '1 Hour').toLowerCase();
-    const m = text.match(/(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)/);
+    let m = text.match(/(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)/);
     if (m) return parseFloat(m[1]);
-    const mins = text.match(/(\d+)\s*(?:minutes?|mins?)/);
-    if (mins) return parseInt(mins[1], 10) / 60;
+    m = text.match(/(\d+)\s*(?:minutes?|mins?)/);
+    if (m) return parseInt(m[1],10) / 60;
+    m = text.match(/\d+(?:\.\d+)?/);
+    if (m) { const n=parseFloat(m[0]); return n>3 ? n/60 : n; }
     return 1;
 }
+function selectedTimeDate(dateString, timeString) {
+    const [h,m] = timeString.split(':').map(Number);
+    const d = new Date(dateString + 'T00:00:00');
+    d.setHours(h,m,0,0);
+    if (h < getOpeningHour(dateString)) d.setDate(d.getDate()+1);
+    return d;
+}
 function slotWithinHours(dateString, timeString, duration) {
-    const [h, m] = timeString.split(':').map(Number);
-    let adjustedHour = h;
-    if (h < getOpeningHour(dateString)) adjustedHour += 24;
-    return adjustedHour * 60 + m + durationHours(duration) * 60 <= 27 * 60;
+    const [h,m] = timeString.split(':').map(Number);
+    let opHour=h; if(h<getOpeningHour(dateString)) opHour+=24;
+    return opHour*60+m + durationHours(duration)*60 <= 27*60;
+}
+function slotHasLeadTime(dateString, timeString) {
+    return selectedTimeDate(dateString,timeString).getTime() >= Date.now()+2*60*60*1000;
 }
 
-/* =========================
-   DATE CHANGE
-========================= */
+/* =========================================================
+   DATE CHANGE / LOAD TIME
+   ========================================================= */
 
 bookingDate.addEventListener(
     'change',
@@ -3303,7 +4057,8 @@ bookingDate.addEventListener(
 
         bookingTime.value = '';
 
-        resetTherapistDisplay();
+
+        resetTherapist();
 
 
         const selectedDate =
@@ -3311,13 +4066,17 @@ bookingDate.addEventListener(
 
 
         if(!selectedDate){
+
+            summary.date = '—';
+
+            summary.time = '—';
+
+            renderSummary();
+
             return;
+
         }
 
-
-        /*
-           DISPLAY DATE IN SUMMARY
-        */
 
         const dateObject =
             new Date(
@@ -3339,50 +4098,51 @@ bookingDate.addEventListener(
 
         summary.time = '—';
 
+
         renderSummary();
 
 
-        timeBox.innerHTML =
-            '<div class="message" style="grid-column:1/-1;">Checking available time slots...</div>';
+        timeBox.innerHTML = `
+            <div
+                class="message"
+                style="grid-column:1/-1;"
+            >
+                Checking available time slots...
+            </div>
+        `;
 
 
-        let cards = [];
+        const cards = [];
 
 
-      /*
-         Spa operating hours:
-         Monday-Friday: 3 PM to 3 AM
-         Saturday-Sunday: 1 PM to 3 AM
+        /*
+           Operating hours: weekdays 3 PM–3 AM, weekends 1 PM–3 AM
+        */
 
-         Last booking start time: 2 AM
-      */
+        const openingHour = getOpeningHour(selectedDate);
+        for(
+            let operatingMinute = openingHour * 60;
+            operatingMinute <= 26 * 60;
+            operatingMinute += 30
+        ){
 
-        // Get the selected date's weekday without timezone shifting.
-        // Sunday = 0, Monday-Friday = 1-5, Saturday = 6.
-        const selectedDay = new Date(selectedDate + 'T12:00:00').getDay();
+            // Visually separate slots that belong to the next calendar date.
+            if (operatingMinute === 24 * 60) {
+                const afterMidnightDate = new Date(selectedDate + 'T00:00:00');
+                afterMidnightDate.setDate(afterMidnightDate.getDate() + 1);
+                const dateLabel = afterMidnightDate.toLocaleDateString('en-US', {
+                    month: 'short', day: 'numeric', year: 'numeric'
+                });
+                const divider = document.createElement('div');
+                divider.className = 'after-midnight-divider';
+                divider.style.cssText = 'grid-column:1/-1; padding:12px 4px 2px; margin-top:4px; border-top:1px solid rgba(212,175,104,.22); color:#d4af68; font-size:12px; font-weight:600; letter-spacing:.06em;';
+                divider.textContent = 'AFTER MIDNIGHT · ' + dateLabel;
+                cards.push(divider);
+            }
 
-        // Weekend opens at 1:00 PM; weekdays open at 3:00 PM.
-        const openingHour = (selectedDay === 0 || selectedDay === 6) ? 13 : 15;
-
-        // Generate hourly booking start times through 2:00 AM.
-        // 3:00 AM is the closing time, so it is not a booking start time.
-        const hours = [];
-
-        for (let hour = openingHour; hour <= 23; hour++) {
-            hours.push(hour);
-        }
-
-        for (let hour = 0; hour <= 2; hour++) {
-            hours.push(hour);
-        }
-
-       for (const hour of hours) {
-
-        
-            const timeValue =
-                String(hour)
-                .padStart(2,'0') +
-                ':00';
+            const actualHour = Math.floor(operatingMinute / 60) % 24;
+            const actualMinute = operatingMinute % 60;
+            const timeValue = String(actualHour).padStart(2, '0') + ':' + String(actualMinute).padStart(2, '0');
 
 
             try{
@@ -3396,19 +4156,10 @@ bookingDate.addEventListener(
                         '&time=' +
                         encodeURIComponent(
                             timeValue
-                        ) +
-                        '&room_type=' +
-                        encodeURIComponent(
-                            roomInput.value || 'Single Room'
-                        ) +
-                        '&duration=' +
-                        encodeURIComponent(
-                            durationInput.value || '1 Hour'
-                        ) +
-                        '&pax=' +
-                        encodeURIComponent(
-                            paxInput.value || '1'
-                        )
+                        ) + '&duration=' + encodeURIComponent(durationInput.value || '1 Hour') +
+                        '&room_type=' + encodeURIComponent(roomInput.value || 'Single Room') +
+                        '&pax=' + encodeURIComponent(paxInput.value || '1') +
+                        '&guest_durations=' + encodeURIComponent(JSON.stringify(individualSelections.slice(0,currentGuestCount()).map(x=>x.duration || durationInput.value || '1 Hour')))
                     );
 
 
@@ -3416,98 +4167,118 @@ bookingDate.addEventListener(
                     await response.json();
 
 
-                const div =
+                const card =
                     document.createElement(
                         'div'
                     );
 
 
-                div.className =
+                card.className =
                     'time-card';
 
 
-                const displayHour =
-                    hour % 12 || 12;
+                const clockHour = actualHour;
+                const displayHour = clockHour % 12 || 12;
+                const displayMinute = String(actualMinute).padStart(2, '0');
+                const meridiem = clockHour >= 12 ? 'PM' : 'AM';
 
 
-                const meridiem =
-                    hour >= 12
-                    ? 'PM'
-                    : 'AM';
+                const isCoupleRoom = (roomInput.value || 'Single Room') === 'Couple Room';
+                const roomStatus = data.available ? 'Available' : 'Occupied';
 
-
-                const isCoupleRoom = roomInput.value === 'Couple Room';
-                const isAvailable = Boolean(data.available);
-                const roomStatus = isAvailable ? 'Available' : 'Occupied';
-
-                div.innerHTML = isCoupleRoom
-                    ? `${displayHour}:00 ${meridiem}<span class="slot-count ${isAvailable ? 'available-text' : 'unavailable-text'}">${roomStatus}</span>`
-                    : `${displayHour}:00 ${meridiem}<span class="slot-count">${data.remaining ?? 0} slot${Number(data.remaining) === 1 ? '' : 's'}</span>`;
+                card.innerHTML = `
+                    ${displayHour}:${displayMinute} ${meridiem}
+                    <span class="slot-count">
+                        ${isCoupleRoom ? roomStatus : `${Number(data.remaining ?? 0)} slot${Number(data.remaining) === 1 ? '' : 's'}`}
+                    </span>
+                `;
 
 
                 const leadTimeBlocked = !slotHasLeadTime(selectedDate, timeValue);
                 const durationBlocked = !slotWithinHours(selectedDate, timeValue, durationInput.value || '1 Hour');
+
                 if(!data.available || leadTimeBlocked || durationBlocked){
-                    div.classList.add('dim');
-                    div.setAttribute('aria-disabled', 'true');
-                    div.style.pointerEvents = 'none';
-                    div.style.opacity = '0.45';
-                    div.style.cursor = 'not-allowed';
-                    div.title = leadTimeBlocked ? 'Must be booked at least 2 hours in advance' : (durationBlocked ? 'Appointment must finish by 3:00 AM' : 'This time slot is unavailable');
+
+                    card.classList.add('dim');
+                    card.setAttribute('aria-disabled', 'true');
+                    card.style.pointerEvents = 'none';
+                    card.style.opacity = '0.45';
+                    card.style.cursor = 'not-allowed';
+                    if (leadTimeBlocked) {
+                        card.title = 'Must be booked at least 2 hours in advance';
+                    } else if (durationBlocked) {
+                        card.title = 'Appointment must finish by 3:00 AM';
+                    } else {
+                        card.title = 'This time slot is unavailable';
+                    }
+
                 }else{
 
-                    div.onclick =
+                    card.addEventListener(
+                        'click',
                         function(){
 
                             document
                             .querySelectorAll(
                                 '.time-card'
                             )
-                            .forEach(card => {
+                            .forEach(function(item){
 
-                                card.classList.remove(
+                                item.classList.remove(
                                     'active'
                                 );
 
                             });
 
 
-                            div.classList.add(
+                            card.classList.add(
                                 'active'
                             );
 
 
                             bookingTime.value =
                                 timeValue;
+                            bookingTime.dispatchEvent(new Event('change'));
 
 
                             summary.time =
                                 `${displayHour}:00 ${meridiem}`;
+                            const summaryBookingDate = new Date(selectedDate + 'T00:00:00');
+                            if (actualHour < openingHour) summaryBookingDate.setDate(summaryBookingDate.getDate() + 1);
+                            summary.date = summaryBookingDate.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'});
 
-                            summary.therapist =
-                                '—';
+
+                            resetTherapist();
+
+
+                            /*
+                               resetTherapist also renders
+                               summary, so restore chosen time.
+                            */
+
+                            summary.time =
+                                `${displayHour}:00 ${meridiem}`;
+
+
+                            therapistMessage.textContent =
+                                'Choose No Preference or click Choose Therapist to view availability.';
 
 
                             renderSummary();
 
-
-                            loadTherapists(
-                                selectedDate,
-                                timeValue
-                            );
-
-                        };
+                        }
+                    );
 
                 }
 
 
-                cards.push(div);
+                cards.push(card);
 
 
             }catch(error){
 
                 console.error(
-                    'Slot error:',
+                    'Time slot error:',
                     error
                 );
 
@@ -3521,15 +4292,21 @@ bookingDate.addEventListener(
 
         if(cards.length === 0){
 
-            timeBox.innerHTML =
-                '<div class="message" style="grid-column:1/-1;">Unable to load available time slots.</div>';
+            timeBox.innerHTML = `
+                <div
+                    class="message"
+                    style="grid-column:1/-1;"
+                >
+                    Unable to load available time slots.
+                </div>
+            `;
 
             return;
 
         }
 
 
-        cards.forEach(card => {
+        cards.forEach(function(card){
 
             timeBox.appendChild(
                 card
@@ -3541,12 +4318,14 @@ bookingDate.addEventListener(
 );
 
 
-/* =========================
-   VALIDATION
-========================= */
+/* =========================================================
+   FORM VALIDATION
+   ========================================================= */
 
 paxInput?.addEventListener('input', renderGuestNameFields);
+paxInput?.addEventListener('input', renderGuestWellnessProfiles);
 roomInput?.addEventListener('change', renderGuestNameFields);
+roomInput?.addEventListener('change', renderGuestWellnessProfiles);
 document.querySelectorAll('.room').forEach(card => card.addEventListener('click', () => setTimeout(renderGuestNameFields, 0)));
 renderGuestNameFields();
 
@@ -3558,12 +4337,25 @@ document
     'submit',
     function(e){
 
+        if (Number(paxInput.value) < 1 || Number(paxInput.value) > 4 || (roomInput.value === 'Couple Room' && Number(paxInput.value) !== 2)) {
+            alert('Single Room allows 1–4 guests. Couple Room is exactly 2 guests.'); e.preventDefault(); return;
+        }
+        if (!slotHasLeadTime(bookingDate.value, bookingTime.value)) {
+            alert('Please book at least 2 hours in advance.'); e.preventDefault(); return;
+        }
+        if (!slotWithinHours(bookingDate.value, bookingTime.value, durationInput.value)) {
+            alert('The appointment must finish by 3:00 AM. Please choose an earlier time or shorter duration.'); e.preventDefault(); return;
+        }
+        if (therapistModeInput.value === 'choose' && selectedTherapistIds.length !== Number(paxInput.value)) {
+            alert('Please select exactly ' + Number(paxInput.value) + ' available therapist(s), or choose No Preference.'); e.preventDefault(); return;
+        }
+
         if(
             !serviceIdInput.value
         ){
 
             alert(
-                'Please select a service first.'
+                'Please select a service.'
             );
 
             e.preventDefault();
@@ -3578,7 +4370,7 @@ document
         ){
 
             alert(
-                'Please select a duration first.'
+                'Please select a duration.'
             );
 
             e.preventDefault();
@@ -3593,7 +4385,7 @@ document
         ){
 
             alert(
-                'Please select a room first.'
+                'Please select a room.'
             );
 
             e.preventDefault();
@@ -3604,12 +4396,26 @@ document
 
 
         if(
-            !bookingDate.value ||
+            !bookingDate.value
+        ){
+
+            alert(
+                'Please select an appointment date.'
+            );
+
+            e.preventDefault();
+
+            return;
+
+        }
+
+
+        if(
             !bookingTime.value
         ){
 
             alert(
-                'Please select your appointment date and time.'
+                'Please select an available time.'
             );
 
             e.preventDefault();
@@ -3619,24 +4425,15 @@ document
         }
 
 
-        if (!slotHasLeadTime(bookingDate.value, bookingTime.value)) {
-            alert('Please book at least 2 hours in advance.');
-            e.preventDefault();
-            return;
-        }
-        if (!slotWithinHours(bookingDate.value, bookingTime.value, durationInput.value)) {
-            alert('Appointment must finish by 3:00 AM.');
-            e.preventDefault();
-            return;
-        }
-
         if(
             !priceInput.value ||
-            Number(priceInput.value) <= 0
+            Number(
+                priceInput.value
+            ) <= 0
         ){
 
             alert(
-                'Unable to calculate booking price. Please select your service duration again.'
+                'Please select a service duration so the booking price can be calculated.'
             );
 
             e.preventDefault();
@@ -3649,9 +4446,257 @@ document
 );
 
 
-/* INITIAL SUMMARY */
+
+durationInput.addEventListener('change', function(){
+    if (bookingDate.value) bookingDate.dispatchEvent(new Event('change'));
+});
+
+/* =========================================================
+   INITIAL SUMMARY
+   ========================================================= */
 
 renderSummary();
+
+
+/* Customer details input guard: proper name and 11-digit Philippine mobile number. */
+const customerNameInput = document.querySelector('input[name="customer_name"]');
+const phoneNumberInput = document.querySelector('input[name="phone"]');
+
+if (customerNameInput) {
+    customerNameInput.addEventListener('input', function () {
+        this.value = this.value.replace(/[^A-Za-zÀ-ÿ .'-]/g, '');
+    });
+}
+
+if (phoneNumberInput) {
+    phoneNumberInput.addEventListener('input', function () {
+        this.value = this.value.replace(/\D/g, '').slice(0, 11);
+    });
+}
+
+
+
+/* =========================================================
+   INDIVIDUAL GROUP BOOKING SELECTIONS
+   ========================================================= */
+const guestServiceWrap = document.getElementById('individualGuestServices');
+const guestTherapistWrap = document.getElementById('individualGuestTherapists');
+const guestSelectionsInput = document.getElementById('guest_selections');
+let individualSelections = [];
+const serviceCatalogCache = {};
+let addonCatalogCache = null;
+
+function currentGuestCount(){return roomInput.value==='Couple Room'?2:Math.max(1,Math.min(4,Number(paxInput.value||1)));}
+const customerTermsText = <?= (json_encode((string)$wellnessTerms, JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_AMP|JSON_HEX_QUOT|JSON_INVALID_UTF8_SUBSTITUTE) ?: '""') ?>;
+function updateCustomerAdditionalTerms(){
+  const wrap=document.getElementById('customerAdditionalTerms');
+  const checkbox=document.getElementById('customerWellnessTermsAccepted');
+  const termsText=wrap?.querySelector('.wellness-terms-text');
+  const needsTerms=currentGuestCount()>1;
+  if(wrap)wrap.style.display=needsTerms?'block':'none';
+  if(checkbox){checkbox.required=needsTerms;if(!needsTerms)checkbox.checked=false;}
+  if(termsText&&!termsText.textContent)termsText.textContent=customerTermsText;
+}
+function escHtml(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function guestDurationMinutes(v){return durationHours(v)*60;}
+function updateGroupHiddenFields(){
+  const count=currentGuestCount();
+  const chosen=individualSelections.slice(0,count);
+  const complete=chosen.length===count&&chosen.every(x=>x.service_id&&x.duration&&Number(x.price)>0);
+  const maxGuest=chosen.reduce((a,b)=>guestDurationMinutes(b.duration)>guestDurationMinutes(a.duration)?b:a,chosen[0]||{});
+  serviceIdInput.value=chosen[0]?.service_id||'';
+  serviceInput.value=chosen.map((x,i)=>`Guest ${i+1}: ${x.service||''}`).join(' | ');
+  durationInput.value=maxGuest?.duration||'';
+  const serviceSum=chosen.reduce((n,x)=>n+Number(x.price||0),0);
+  const addonSum=chosen.reduce((n,x)=>n+(x.addons||[]).reduce((a,b)=>a+Number(b.price||0),0),0);
+  basePrice=serviceSum; addonTotal=addonSum;
+  addonsInput.value=chosen.map((x,i)=>(x.addons||[]).map(a=>`Guest ${i+1}: ${a.name}`).join(', ')).filter(Boolean).join('; ');
+  priceInput.value=(serviceSum+addonSum).toFixed(2);
+  guestSelectionsInput.value=JSON.stringify(chosen.map((x,i)=>({guest_number:i+1,service_id:Number(x.service_id||0),duration:x.duration||'',addons:(x.addons||[]).map(a=>Number(a.id)),therapist_id:Number(x.therapist_id||0)})));
+  summary.service=complete?chosen.map((x,i)=>`G${i+1}: ${x.service}`).join(' / '):'Select a service for each guest';
+  summary.duration=chosen.length?chosen.map((x,i)=>`Guest ${i+1}: ${x.duration||'Not selected'}`).join(' | '):'—';
+  summary.addons=addonSum?chosen.flatMap((x,i)=>(x.addons||[]).map(a=>`G${i+1}: ${a.name}`)).join(', '):'None';
+  summary.therapist=chosen.some(x=>x.therapist_id)?chosen.map((x,i)=>x.therapist_name?`G${i+1}: ${x.therapist_name}`:`G${i+1}: No Preference`).join(', '):'No Preference';
+  document.getElementById('sumBasePrice').textContent=money(serviceSum);
+  document.getElementById('sumAddonPrice').textContent=money(addonSum);
+  renderSummary();
+}
+function ensureGuestSelectionCount(){
+  const count=currentGuestCount();
+  individualSelections=Array.from({length:count},(_,i)=>individualSelections[i]||{service_id:0,service:'',description:'',duration:'',price:0,addons:[],therapist_id:0,therapist_name:''});
+  renderGuestServiceCards();renderGuestTherapistCards();updateGroupHiddenFields();
+}
+async function getServiceCatalog(category){
+  if(serviceCatalogCache[category])return serviceCatalogCache[category];
+  const r=await fetch('../get_services_by_category.php?cat='+encodeURIComponent(category),{cache:'no-store'});if(!r.ok)throw new Error('Unable to load services');
+  const data=await r.json();serviceCatalogCache[category]=Array.isArray(data)?data:[];return serviceCatalogCache[category];
+}
+async function getAddonCatalog(){if(addonCatalogCache)return addonCatalogCache;const r=await fetch('../get_addons.php',{cache:'no-store'});if(!r.ok)throw new Error('Unable to load add-ons');addonCatalogCache=await r.json();return Array.isArray(addonCatalogCache)?addonCatalogCache:[];}
+function renderGuestServiceCards(){
+  if(!guestServiceWrap)return;guestServiceWrap.innerHTML='';
+  individualSelections.forEach((sel,index)=>{
+    const card=document.createElement('div');card.className='guest-choice-card';card.dataset.guestIndex=index;
+    card.innerHTML=`<h3>Guest ${index+1} Service Selection</h3>
+      <div class="field-title">Category</div><div class="selection-grid guest-categories"><div class="select-card guest-category" data-category="Massage">Massage</div><div class="select-card guest-category" data-category="Package">Package</div><div class="select-card guest-category" data-category="Promo">Promo</div></div>
+      <div class="field-title">Service</div><div class="selection-grid guest-services"><div class="message">Select a category first.</div></div>
+      <div class="service-description guest-service-description">Select a service to view its description.</div>
+      <div class="field-title">Duration</div><div class="selection-grid guest-durations"><div class="message">Select a service first.</div></div>
+      <div class="field-title">Add-ons <span style="color:#777;text-transform:none">(Optional)</span></div><div class="guest-addons"><div class="message">Select a service first.</div></div>
+      <div class="guest-line-total">Guest ${index+1} Total: <span class="guest-total">₱0.00</span></div>`;
+    guestServiceWrap.appendChild(card);
+    if(sel.category){const cat=card.querySelector(`[data-category="${CSS.escape(sel.category)}"]`);if(cat)cat.classList.add('active');}
+    if(sel.service_id&&sel.service){card.querySelector('.guest-services').innerHTML=`<div class="select-card active">${escHtml(sel.service)}</div>`;card.querySelector('.guest-service-description').textContent=sel.description||'No description available.';}
+    if(sel.duration){card.querySelector('.guest-durations').innerHTML=`<div class="select-card active">${escHtml(sel.duration)} <span class="card-price">${money(sel.price)}</span></div>`;}
+    card.querySelector('.guest-total').textContent=money(Number(sel.price||0)+(sel.addons||[]).reduce((a,b)=>a+Number(b.price||0),0));
+  });
+}
+async function loadGuestServices(card,index,category){
+  const box=card.querySelector('.guest-services');box.innerHTML='<div class="message">Loading services...</div>';
+  try{const data=await getServiceCatalog(category);box.innerHTML='';if(!data.length){box.innerHTML='<div class="message">No services available.</div>';return;}
+    data.forEach(s=>{const el=document.createElement('div');el.className='select-card';el.textContent=s.service_name;el.dataset.id=s.id;el.dataset.name=s.service_name;el.dataset.description=s.description||'';if(Number(s.id)===Number(individualSelections[index].service_id))el.classList.add('active');el.addEventListener('click',()=>selectGuestService(card,index,s));box.appendChild(el);});
+  }catch(e){box.innerHTML='<div class="message">Unable to load services.</div>';console.error(e);}
+}
+async function selectGuestService(card,index,service){
+  const sel=individualSelections[index];sel.category=service.category||card.querySelector('.guest-category.active')?.dataset.category||'';sel.service_id=Number(service.id);sel.service=service.service_name;sel.description=service.description||'';card.querySelector('.guest-service-description').textContent=sel.description||'No description available.';sel.duration='';sel.price=0;sel.addons=[];sel.therapist_id=0;sel.therapist_name='';
+  card.querySelectorAll('.guest-services .select-card').forEach(x=>x.classList.toggle('active',Number(x.dataset.id)===Number(service.id)));
+  const durationBox=card.querySelector('.guest-durations');durationBox.innerHTML='<div class="message">Loading durations...</div>';
+  try{const r=await fetch('../get_duration.php?id='+encodeURIComponent(service.id),{cache:'no-store'});const data=await r.json();durationBox.innerHTML='';if(!Array.isArray(data)||!data.length){durationBox.innerHTML='<div class="message">No duration available.</div>';return;}
+    data.forEach(d=>{const el=document.createElement('div');el.className='select-card';el.innerHTML=`${escHtml(d.duration)}<span class="card-price">${money(d.price)}</span>`;el.addEventListener('click',()=>{durationBox.querySelectorAll('.select-card').forEach(x=>x.classList.remove('active'));el.classList.add('active');sel.duration=d.duration;sel.price=Number(d.price)||0;sel.therapist_id=0;sel.therapist_name='';refreshGuestTherapistAvailability(index);updateGuestCardTotal(card,index);updateGroupHiddenFields();refreshSlotDuration();});durationBox.appendChild(el);});
+    const fixed=card.querySelector('.guest-category.active')?.dataset.category==='Package'&&data.length===1;if(fixed){const el=durationBox.querySelector('.select-card');el.click();el.style.pointerEvents='none';el.title='Package duration is fixed.';}
+  }catch(e){durationBox.innerHTML='<div class="message">Unable to load durations.</div>';console.error(e);}
+  const addonsBox=card.querySelector('.guest-addons');addonsBox.innerHTML='<div class="message">Loading add-ons...</div>';
+  try{const data=await getAddonCatalog();addonsBox.innerHTML='';if(!data.length){addonsBox.innerHTML='<div class="message">No add-ons available.</div>';return;}data.forEach(a=>{const el=document.createElement('div');el.className='select-card';el.innerHTML=`${escHtml(a.service_name)}<span class="card-price">${money(a.price)}</span>`;el.addEventListener('click',()=>{const pos=sel.addons.findIndex(x=>Number(x.id)===Number(a.id));if(pos>=0){sel.addons.splice(pos,1);el.classList.remove('active');}else{sel.addons.push({id:Number(a.id),name:a.service_name,price:Number(a.price)||0});el.classList.add('active');}updateGuestCardTotal(card,index);updateGroupHiddenFields();});addonsBox.appendChild(el);});}
+  catch(e){addonsBox.innerHTML='<div class="message">Unable to load add-ons.</div>';console.error(e);}
+  updateGuestCardTotal(card,index);updateGroupHiddenFields();refreshSlotDuration();
+}
+function updateGuestCardTotal(card,index){const s=individualSelections[index];const total=Number(s.price||0)+(s.addons||[]).reduce((a,b)=>a+Number(b.price||0),0);const out=card.querySelector('.guest-total');if(out)out.textContent=money(total);}
+function refreshSlotDuration(){if(durationInput.value&&bookingDate.value)bookingDate.dispatchEvent(new Event('change'));}
+if(guestServiceWrap){guestServiceWrap.addEventListener('click',async e=>{const cat=e.target.closest('.guest-category');if(!cat)return;const card=cat.closest('.guest-choice-card');const index=Number(card.dataset.guestIndex);card.querySelectorAll('.guest-category').forEach(x=>x.classList.toggle('active',x===cat));individualSelections[index].category=cat.dataset.category;individualSelections[index].service_id=0;individualSelections[index].service='';individualSelections[index].description='';card.querySelector('.guest-service-description').textContent='Select a service to view its description.';individualSelections[index].duration='';individualSelections[index].price=0;individualSelections[index].addons=[];individualSelections[index].therapist_id=0;individualSelections[index].therapist_name='';card.querySelector('.guest-durations').innerHTML='<div class="message">Select a service first.</div>';card.querySelector('.guest-addons').innerHTML='<div class="message">Select a service first.</div>';await loadGuestServices(card,index,cat.dataset.category);updateGroupHiddenFields();refreshSlotDuration();});}
+function renderGuestTherapistCards(){
+  if(!guestTherapistWrap)return;
+  guestTherapistWrap.innerHTML='';
+  individualSelections.forEach((sel,index)=>{
+    const c=document.createElement('div');
+    c.className='guest-choice-card';
+    c.dataset.guestIndex=index;
+    c.innerHTML=`<h3>Guest ${index+1} Therapist</h3><div class="message">${sel.duration?'Select a date and time first.':'Choose a service and duration first.'}</div><div class="guest-therapist-select"><div class="select-card active guest-no-preference">No Preference <span class="card-desc">Any available therapist</span></div><div class="guest-therapist-list"></div></div>`;
+    guestTherapistWrap.appendChild(c);
+    c.querySelector('.guest-no-preference').addEventListener('click',()=>{
+      const option=c.querySelector('.guest-no-preference');
+      if(option.classList.contains('unavailable'))return;
+      sel.therapist_id=0;sel.therapist_name='';option.classList.add('active');
+      c.querySelectorAll('.guest-therapist-list .select-card').forEach(x=>x.classList.remove('active'));
+      updateGroupHiddenFields();
+    });
+  });
+}
+async function refreshGuestTherapistAvailability(index){
+  const wrap=guestTherapistWrap?.querySelector(`[data-guest-index="${index}"]`);if(!wrap)return;
+  const list=wrap.querySelector('.guest-therapist-list');const sel=individualSelections[index];
+  const noPref=wrap.querySelector('.guest-no-preference');
+  if(!sel.duration||!bookingDate.value||!bookingTime.value){
+    list.innerHTML='<div class="message">Select service, duration, date and time first.</div>';
+    noPref.classList.remove('unavailable');noPref.setAttribute('aria-disabled','false');
+    return;
+  }
+  list.innerHTML='<div class="message">Checking available therapists...</div>';
+  try{
+    const url='../get_available_therapists.php?date='+encodeURIComponent(bookingDate.value)+'&time='+encodeURIComponent(bookingTime.value)+'&duration='+encodeURIComponent(sel.duration);
+    const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw new Error('Availability request failed');
+    const data=await r.json();list.innerHTML='';
+    const otherAssigned=individualSelections.filter((x,i)=>i!==index&&Number(x.therapist_id)>0).map(x=>Number(x.therapist_id));
+    const currentTherapist=(Array.isArray(data)?data:[]).find(t=>Number(t.id)===Number(sel.therapist_id));
+    if(sel.therapist_id&&(!currentTherapist||!currentTherapist.available||otherAssigned.includes(Number(sel.therapist_id)))){
+      sel.therapist_id=0;sel.therapist_name='';noPref.classList.add('active');updateGroupHiddenFields();
+    }
+    const availableForThisGuest=(Array.isArray(data)?data:[]).filter(t=>Boolean(t.available)&&!otherAssigned.includes(Number(t.id)));
+    const noneAvailable=availableForThisGuest.length===0;
+    noPref.classList.toggle('unavailable',noneAvailable);
+    noPref.setAttribute('aria-disabled',noneAvailable?'true':'false');
+    noPref.innerHTML=noneAvailable
+      ? 'No Preference <span class="card-desc">No therapists available for this schedule</span>'
+      : 'No Preference <span class="card-desc">Any available therapist</span>';
+    if(noneAvailable){
+      noPref.classList.remove('active');
+      list.innerHTML='<div class="message">No therapists are available for this schedule. Please choose another time slot.</div>';
+    } else if(Number(sel.therapist_id)===0){noPref.classList.add('active');}
+    (Array.isArray(data)?data:[]).forEach(t=>{
+      const el=document.createElement('div');el.className='select-card';el.textContent=t.name;el.dataset.id=t.id;
+      const available=Boolean(t.available)&&!otherAssigned.includes(Number(t.id));
+      if(!available){el.classList.add('unavailable');el.textContent=t.name+' — Unavailable';}
+      else{el.addEventListener('click',()=>{
+        individualSelections.forEach((x,i)=>{if(i!==index&&Number(x.therapist_id)===Number(t.id)){x.therapist_id=0;x.therapist_name='';const otherCard=guestTherapistWrap.querySelector(`[data-guest-index="${i}"]`);otherCard?.querySelector('.guest-no-preference')?.classList.add('active');}});
+        sel.therapist_id=Number(t.id);sel.therapist_name=t.name;noPref.classList.remove('active');
+        list.querySelectorAll('.select-card').forEach(x=>x.classList.toggle('active',x===el));updateGroupHiddenFields();
+        individualSelections.forEach((_,i)=>{if(i!==index)refreshGuestTherapistAvailability(i);});
+      });}
+      if(Number(sel.therapist_id)===Number(t.id))el.classList.add('active');list.appendChild(el);
+    });
+    if(!Array.isArray(data)||data.length===0)list.innerHTML='<div class="message">No active therapists found. Please choose another time slot.</div>';
+  }catch(e){
+    noPref.classList.add('unavailable');noPref.setAttribute('aria-disabled','true');
+    list.innerHTML='<div class="message">Unable to verify therapist availability. Please try again.</div>';console.error(e);
+  }
+}
+function refreshAllGuestTherapists(){individualSelections.forEach((s,i)=>refreshGuestTherapistAvailability(i));updateGroupHiddenFields();}
+bookingDate.addEventListener('change',()=>setTimeout(refreshAllGuestTherapists,250));
+bookingTime.addEventListener('change',()=>setTimeout(refreshAllGuestTherapists,100));
+if(guestTherapistWrap){guestTherapistWrap.addEventListener('click',e=>{const noPref=e.target.closest('.guest-no-preference');if(!noPref||noPref.classList.contains('unavailable'))return;const index=Number(noPref.closest('.guest-choice-card').dataset.guestIndex);individualSelections[index].therapist_id=0;individualSelections[index].therapist_name='';updateGroupHiddenFields();});}
+// Guest 1 uses the saved account profile; render forms only for additional guests.
+const guestWellnessWrap = document.getElementById('guestWellnessProfiles');
+function renderGuestWellnessProfiles(){
+  if(!guestWellnessWrap)return;
+  const count=currentGuestCount();
+  const previous={};
+  guestWellnessWrap.querySelectorAll('[data-wellness-guest]').forEach(card=>{
+    const n=Number(card.dataset.wellnessGuest); previous[n]={};
+    card.querySelectorAll('[name^="wellness["]').forEach(el=>{const m=el.name.match(/wellness\[\d+\]\[([^\]]+)\]/);if(m)previous[n][m[1]]=el.type==='checkbox'?(el.checked?'1':''):el.value;});
+  });
+  guestWellnessWrap.innerHTML='';
+  for(let n=2;n<=count;n++){
+    const v=previous[n]||{}; const card=document.createElement('div');card.className='guest-choice-card';card.dataset.wellnessGuest=n;
+    card.innerHTML=`<h3>Guest ${n} Wellness Profile</h3>
+      <div class="form-grid">
+        <div class="form-group"><label>Allergies <span class="required">*</span></label><input name="wellness[${n}][allergies]" required placeholder="e.g. None, Lavender, Coconut Oil"></div>
+        <div class="form-group"><label>Skin Sensitivity <span class="required">*</span></label><select name="wellness[${n}][skin_sensitivity]" required><option value="">Select one</option><option>Normal Skin</option><option>Sensitive Skin</option><option>Dry Skin</option><option>Oily Skin</option><option>Not Sure</option></select></div>
+        <div class="form-group"><label>Medical Conditions <span class="required">*</span></label><input name="wellness[${n}][medical_conditions]" required placeholder="e.g. None, Asthma, Diabetes"></div>
+        <div class="form-group"><label>Body Pain / Injuries <span class="required">*</span></label><input name="wellness[${n}][body_pain_injuries]" required placeholder="e.g. None, Back Pain, Neck Pain"></div>
+        <div class="form-group"><label>Preferred Pressure <span class="required">*</span></label><select name="wellness[${n}][preferred_pressure]" required><option value="">Select pressure</option><option>Very Light</option><option>Light</option><option>Medium</option><option>Strong</option><option>No Preference</option></select></div>
+        <div class="form-group full"><label>Special Requests (Optional)</label><textarea name="wellness[${n}][special_requests]" placeholder="Any wellness-related request..."></textarea></div>
+        <div class="form-group"><label>Emergency Contact Name (Optional)</label><input name="wellness[${n}][emergency_contact_name]" placeholder="Emergency contact name"></div>
+        <div class="form-group"><label>Emergency Contact Number (Optional)</label><input name="wellness[${n}][emergency_contact_number]" placeholder="09XXXXXXXXX" maxlength="11" inputmode="numeric"></div>
+      </div>`;
+    guestWellnessWrap.appendChild(card);
+    Object.entries(v).forEach(([key,value])=>{const el=card.querySelector(`[name="wellness[${n}][${key}]"]`);if(el){if(el.type==='checkbox')el.checked=value==='1';else el.value=value;}});
+  }
+}
+
+const originalPaxRender=renderGuestNameFields;
+paxInput.addEventListener('input',()=>{ensureGuestSelectionCount();renderGuestWellnessProfiles();updateCustomerAdditionalTerms();if(bookingDate.value)bookingDate.dispatchEvent(new Event('change'));});
+roomInput.addEventListener('change',()=>{ensureGuestSelectionCount();renderGuestWellnessProfiles();updateCustomerAdditionalTerms();});
+document.querySelectorAll('.room').forEach(el=>el.addEventListener('click',()=>setTimeout(()=>{ensureGuestSelectionCount();renderGuestWellnessProfiles();updateCustomerAdditionalTerms();},0)));
+ensureGuestSelectionCount();
+renderGuestWellnessProfiles();
+updateCustomerAdditionalTerms();
+
+// Keep the legacy time-slot checker informed of the longest service duration.
+// It uses the maximum guest duration for conservative room-capacity checking.
+const originalSubmitValidation=document.getElementById('bookingForm');
+originalSubmitValidation.addEventListener('submit',e=>{
+  const count=currentGuestCount();
+  updateCustomerAdditionalTerms();
+  const termsCheckbox=document.getElementById('customerWellnessTermsAccepted');
+  if(count>1&&termsCheckbox&&!termsCheckbox.checked){e.preventDefault();alert('Please read and accept the Wellness Profile Terms and Conditions for the additional guests.');termsCheckbox.focus();return;}
+  if(individualSelections.length!==count||individualSelections.some(s=>!s.service_id||!s.duration||Number(s.price)<=0)){e.preventDefault();alert('Please select a service and duration for every guest.');return;}
+  if(!guestNamesAreValid()){e.preventDefault();return;}
+  const wellnessCards=Array.from(guestWellnessWrap?.querySelectorAll('[data-wellness-guest]')||[]);
+  if(wellnessCards.length!==Math.max(0,count-1)||wellnessCards.some(card=>Array.from(card.querySelectorAll('[required]')).some(field=>!field.value.trim()))){e.preventDefault();alert('Please complete the required Wellness Profile fields for every additional guest.');return;}
+  guestSelectionsInput.value=JSON.stringify(individualSelections.map((s,i)=>({guest_number:i+1,service_id:s.service_id,duration:s.duration,addons:s.addons.map(a=>a.id),therapist_id:s.therapist_id||0})));
+});
+function guestNamesAreValid(){const names=[document.querySelector('[name="customer_name"]')?.value||'',...Array.from(document.querySelectorAll('[name="guest_names[]"]')).map(x=>x.value)];if(names.length!==currentGuestCount()||names.some(n=>!/^([\p{L}][\p{L}\s.'-]{1,99})$/u.test(n.trim()))){alert('Please enter the full name of every guest.');return false;}return true;}
+
+// Landing-page service prefill: apply the requested service to Guest 1.
+(async function prefillIndividualGuestService(){const params=new URLSearchParams(location.search);const id=Number(params.get('service_id')||0);if(!id)return;for(const category of ['Massage','Package','Promo']){try{const rows=await getServiceCatalog(category);const match=rows.find(x=>Number(x.id)===id);if(!match)continue;const card=guestServiceWrap.querySelector('.guest-choice-card');const cat=card.querySelector(`[data-category="${CSS.escape(category)}"]`);cat.click();await new Promise(resolve=>setTimeout(resolve,250));const serviceCard=Array.from(card.querySelectorAll('.guest-services .select-card')).find(x=>Number(x.dataset.id)===id);if(serviceCard){serviceCard.click();await new Promise(resolve=>setTimeout(resolve,400));const wanted=params.get('duration');const d=Array.from(card.querySelectorAll('.guest-durations .select-card')).find(x=>wanted&&(x.textContent||'').toLowerCase().includes(wanted.toLowerCase()))||card.querySelector('.guest-durations .select-card');if(d)d.click();}break;}catch(e){console.warn(e);}}})();
 
 </script>
 

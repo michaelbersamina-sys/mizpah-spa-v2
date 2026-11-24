@@ -1,3 +1,4 @@
+
 <?php
 session_start();
 include '../includes/db.php';
@@ -586,20 +587,20 @@ tbody tr:hover {
                                     <a
                                         class="btn btn-hide"
                                         href="ratings.php?hide=<?= $id ?>"
-                                        onclick="return confirm('Hide this customer review?')"
+                                        data-miz-confirm="Hide this customer review?"
                                     >Hide</a>
                                 <?php } else { ?>
                                     <a
                                         class="btn btn-show"
                                         href="ratings.php?show=<?= $id ?>"
-                                        onclick="return confirm('Show this customer review?')"
+                                        data-miz-confirm="Show this customer review?"
                                     >Show</a>
                                 <?php } ?>
 
                                 <a
                                     class="btn btn-remove"
                                     href="ratings.php?delete=<?= $id ?>"
-                                    onclick="return confirm('Remove this review permanently? This cannot be undone.')"
+                                    data-miz-confirm="Remove this review permanently? This cannot be undone."
                                 >Remove</a>
                             </div>
                         </td>
@@ -652,6 +653,75 @@ reviewSearch.addEventListener('input', function () {
         'Showing ' + visibleCount + ' of ' + reviewRows.length + ' review' +
         (reviewRows.length === 1 ? '' : 's');
 });
+</script>
+
+
+<!-- Mizpah Modern Admin Dialogs -->
+<div class="miz-dialog-backdrop" id="mizDialog" aria-hidden="true">
+  <div class="miz-dialog" role="dialog" aria-modal="true" aria-labelledby="mizDialogTitle">
+    <div class="miz-dialog-icon" id="mizDialogIcon">!</div>
+    <h3 id="mizDialogTitle">Please confirm</h3>
+    <p id="mizDialogMessage">Are you sure you want to continue?</p>
+    <div class="miz-dialog-actions">
+      <button type="button" class="miz-dialog-cancel" id="mizDialogCancel">Cancel</button>
+      <button type="button" class="miz-dialog-confirm" id="mizDialogConfirm">Continue</button>
+    </div>
+  </div>
+</div>
+<style>
+.miz-dialog-backdrop{
+    position:fixed;inset:0;z-index:3000;display:flex;align-items:center;justify-content:center;
+    padding:20px;background:rgba(0,0,0,.76);backdrop-filter:blur(7px);
+    opacity:0;visibility:hidden;transition:opacity .22s ease,visibility .22s ease;
+}
+.miz-dialog-backdrop.is-open{opacity:1;visibility:visible}
+.miz-dialog{
+    width:min(100%,390px);padding:27px 25px 22px;border:1px solid rgba(214,194,156,.27);
+    border-radius:16px;background:linear-gradient(145deg,#1b1915,#100f0d 72%);
+    box-shadow:0 24px 80px rgba(0,0,0,.58),inset 0 1px 0 rgba(255,255,255,.035);
+    text-align:center;color:#D6C29C;transform:translateY(12px) scale(.98);
+    transition:transform .22s ease;
+}
+.miz-dialog-backdrop.is-open .miz-dialog{transform:translateY(0) scale(1)}
+.miz-dialog-icon{
+    width:43px;height:43px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;
+    border:1px solid rgba(214,194,156,.34);border-radius:50%;color:#D6C29C;
+    background:rgba(214,194,156,.08);font-family:'Playfair Display',serif;font-size:22px;
+}
+.miz-dialog h3{
+    margin:0 0 9px;color:#D6C29C;font-family:'Playfair Display',serif;
+    font-size:21px;font-weight:600;
+}
+.miz-dialog p{
+    margin:0;color:#aaa198;font-family:'Poppins',sans-serif;font-size:11px;
+    line-height:1.75;overflow-wrap:anywhere;
+}
+.miz-dialog-actions{margin-top:22px;display:flex;justify-content:center;gap:9px}
+.miz-dialog-actions button{
+    min-width:112px;padding:10px 22px;border:1px solid #D6C29C;border-radius:8px;
+    font-family:'Poppins',sans-serif;font-size:10px;font-weight:600;cursor:pointer;
+    transition:background .18s ease,transform .18s ease;
+}
+.miz-dialog-cancel{background:transparent;color:#D6C29C}
+.miz-dialog-cancel:hover{background:rgba(214,194,156,.10)}
+.miz-dialog-confirm{background:#D6C29C;color:#17130e}
+.miz-dialog-confirm:hover{background:#ead8b1;transform:translateY(-1px)}
+@media(max-width:480px){.miz-dialog{padding:24px 20px 20px}.miz-dialog-actions button{min-width:0;flex:1}}
+</style>
+<script>
+(()=>{
+ const backdrop=document.getElementById('mizDialog'); if(!backdrop)return;
+ const title=document.getElementById('mizDialogTitle'), message=document.getElementById('mizDialogMessage'), icon=document.getElementById('mizDialogIcon');
+ const yes=document.getElementById('mizDialogConfirm'), no=document.getElementById('mizDialogCancel');
+ let pending=null;
+ function close(){backdrop.classList.remove('is-open');backdrop.setAttribute('aria-hidden','true');pending=null}
+ function open(text,href){title.textContent='Please confirm';message.textContent=text||'Are you sure you want to continue?';icon.textContent='?';yes.textContent='Yes, continue';pending=href;backdrop.classList.add('is-open');backdrop.setAttribute('aria-hidden','false');yes.focus()}
+ document.addEventListener('click',e=>{const link=e.target.closest('a[data-miz-confirm]');if(!link)return;e.preventDefault();open(link.getAttribute('data-miz-confirm'),link.href)});
+ yes.addEventListener('click',()=>{if(pending){const target=pending;close();window.location.href=target}});
+ no.addEventListener('click',close);
+ backdrop.addEventListener('click',e=>{if(e.target===backdrop)close()});
+ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&backdrop.classList.contains('is-open'))close()});
+})();
 </script>
 
 </body>
