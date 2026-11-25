@@ -13,6 +13,7 @@ if ($wellnessTerms === '') {
 }
 
 
+
 function bookingDurationMinutes($duration) {
     $duration = strtolower(trim((string)$duration));
     $hours = 0.0; $minutes = 0;
