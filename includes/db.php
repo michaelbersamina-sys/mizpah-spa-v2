@@ -26,4 +26,8 @@ mysqli_real_connect(
     null,
     MYSQLI_CLIENT_SSL
 );
+
+$conn->query("SET time_zone = '+08:00'");
+
+date_default_timezone_set('Asia/Manila');
 ?>
